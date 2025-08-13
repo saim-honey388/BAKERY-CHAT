@@ -1,0 +1,34 @@
+[
+  {
+    "question": "What are your hours?",
+    "answer": "We are open Monday through Friday from 6am to 8pm, Saturday from 7am to 9pm, and Sunday from 7am to 6pm. All our locations follow the same hours."
+  },
+  {
+    "question": "Do you offer delivery?",
+    "answer": "Yes, we offer delivery within a 5-mile radius for orders over $30. Delivery fee is $5 for orders under $50 and free for orders over $50. Same-day delivery is available for orders placed before 2pm."
+  },
+  {
+    "question": "Can I place custom orders?",
+    "answer": "Yes, we accept custom cake orders with at least 48 hours notice. For wedding cakes and large orders, we recommend booking 2-3 weeks in advance. Please call our Downtown branch at (555) 123-4567 to discuss your requirements."
+  },
+  {
+    "question": "Do you have gluten-free options?",
+    "answer": "Yes, we offer a selection of gluten-free products including bread, cakes, and pastries. These items are clearly marked and prepared in a dedicated area to prevent cross-contamination."
+  },
+  {
+    "question": "How fresh is your bread?",
+    "answer": "All our bread is baked fresh daily. We start baking at 4am each morning to ensure our customers get the freshest products possible. Any unsold bread at the end of the day is donated to local food banks."
+  },
+  {
+    "question": "Do you offer catering services?",
+    "answer": "Yes, we provide catering services for events, parties, and corporate functions. We can create custom cakes, bread baskets, and pastry assortments. Minimum order of $100 required for catering services. Please contact us at least one week in advance for large orders."
+  },
+  {
+    "question": "What payment methods do you accept?",
+    "answer": "We accept cash, all major credit cards, Apple Pay, and Google Pay. For orders over $50, we also offer payment plans through our partnership with local financing services."
+  },
+  {
+    "question": "Do you have vegan options?",
+    "answer": "Yes, we offer several vegan products including our vegan sourdough bread, vegan croissants, and a selection of vegan cookies. These items are clearly marked and made without any animal products."
+  }
+]

@@ -1,0 +1,266 @@
+[
+  {
+    "id": "136cb4dd-f515-4015-adbc-1633526aa2c0",
+    "branch": "main",
+    "category": "locations",
+    "text": "name: Downtown Location; address: 123 Main Street, Downtown District; hours: Monday-Friday 6am-8pm, Saturday 7am-9pm, Sunday 7am-6pm; phone: (555) 123-4567; manager: Sarah Johnson; parking: Street parking and nearby public garage; services: ['Delivery', 'Catering', 'Special Orders'].",
+    "source": "locations.json#item_1",
+    "timestamp": "2025-08-13T10:51:14.019515"
+  },
+  {
+    "id": "b45363e8-9d25-476a-839b-69a0285975b7",
+    "branch": "main",
+    "category": "locations",
+    "text": "name: Westside Location; address: 456 Oak Avenue, Westside Shopping Center; hours: Monday-Saturday 6am-9pm, Sunday 7am-6pm; phone: (555) 987-6543; manager: Michael Chen; parking: Free parking in shopping center lot; services: ['Catering', 'Special Orders'].",
+    "source": "locations.json#item_2",
+    "timestamp": "2025-08-13T10:51:14.019604"
+  },
+  {
+    "id": "ea20c2f7-58a7-40ec-adf7-93470f477025",
+    "branch": "main",
+    "category": "locations",
+    "text": "name: Mall Location; address: 789 Shopping Mall, Level 1, Food Court; hours: Monday-Sunday 8am-10pm (follows mall hours); phone: (555) 456-7890; manager: Jennifer Williams; parking: Mall parking facilities; services: ['Special Orders'].",
+    "source": "locations.json#item_3",
+    "timestamp": "2025-08-13T10:51:14.019653"
+  },
+  {
+    "id": "abcee67d-6301-4102-8fa4-3868ca253b3a",
+    "branch": "main",
+    "category": "general_info",
+    "text": "Sunrise Bakery has been serving the community with fresh, delicious baked goods since 1985. Founded by Maria Rodriguez, a third-generation baker, our bakery combines traditional European baking techniques with modern innovation. Our Story:\nMaria learned the art of bread-making from her grandmother in Italy before moving to the United States. She opened Sunrise Bakery with a single oven and a dream to share her family's baking traditions with the local community. Today, we operate three locations while maintaining the same commitment to quality and craftsmanship that defined our humble beginnings. Our Philosophy:\n- Use only the finest ingredients sourced locally when possible\n- Bake fresh daily with no preservatives or artificial additives\n- Create a welcoming environment for all our customers\n- Support local farmers and suppliers.",
+    "source": "general_info.txt#ABOUT US",
+    "timestamp": "2025-08-13T10:51:14.020104"
+  },
+  {
+    "id": "90f8c5b8-5ed5-48df-ad2b-0aeba137726e",
+    "branch": "main",
+    "category": "general_info",
+    "text": "Downtown Branch:\nAddress: 123 Main Street, Downtown District\nHours: Monday-Friday 6am-8pm, Saturday 7am-9pm, Sunday 7am-6pm\nPhone: (555) 123-4567\nParking: Street parking and nearby public garage\n\nWestside Branch:\nAddress: 456 Oak Avenue, Westside Shopping Center\nHours: Monday-Saturday 6am-9pm, Sunday 7am-6pm\nPhone: (555) 987-6543\nParking: Free parking in shopping center lot\n\nMall Location:\nAddress: 789 Shopping Mall, Level 1, Food Court\nHours: Monday-Sunday 8am-10pm (follows mall hours)\nPhone: (555) 456-7890\nParking: Mall parking facilities.",
+    "source": "general_info.txt#LOCATIONS",
+    "timestamp": "2025-08-13T10:51:14.020172"
+  },
+  {
+    "id": "4fd3dc5b-5854-4175-a534-ede8dbf52fb6",
+    "branch": "main",
+    "category": "general_info",
+    "text": "Delivery:\nWe offer delivery within a 5-mile radius for orders over $30. Delivery fee is $5 for orders under $50 and free for orders over $50. Same-day delivery available for orders placed before 2pm. Catering:\nOur bakery provides catering services for events, parties, and corporate functions. We can create custom cakes, bread baskets, and pastry assortments. Minimum order of $100 required for catering services. Special Orders:\nCustom cakes and specialty items can be ordered with 48 hours notice. For wedding cakes and large orders, we recommend booking 2-3 weeks in advance. Dietary Accommodations:\nWe offer gluten-free, dairy-free, and vegan options. Please inform our staff of any allergies or dietary restrictions when placing orders.",
+    "source": "general_info.txt#SERVICES",
+    "timestamp": "2025-08-13T10:51:14.020238"
+  },
+  {
+    "id": "6535c4df-7121-4b52-a617-f991ff18f345",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Breads; item: French Baguette; price: $3. 50; description: Traditional French bread with crispy crust and soft interior.",
+    "source": "menu.csv#row_1",
+    "timestamp": "2025-08-13T10:51:14.042296"
+  },
+  {
+    "id": "de311652-72ac-4a7f-a98f-add481c34508",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Breads; item: Sourdough Loaf; price: $5. 00; description: Organic sourdough made with local flour and our 20-year-old starter.",
+    "source": "menu.csv#row_2",
+    "timestamp": "2025-08-13T10:51:14.042384"
+  },
+  {
+    "id": "940247d2-f605-4e1c-ace5-0456d54b7678",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Breads; item: Whole Wheat Bread; price: $4. 25; description: Nutritious whole wheat bread packed with seeds and grains.",
+    "source": "menu.csv#row_3",
+    "timestamp": "2025-08-13T10:51:14.042440"
+  },
+  {
+    "id": "74931c97-414a-4bed-bcf0-be9abd9d624b",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Breads; item: Rye Bread; price: $4. 00; description: Dense rye bread with caraway seeds and tangy flavor.",
+    "source": "menu.csv#row_4",
+    "timestamp": "2025-08-13T10:51:14.042491"
+  },
+  {
+    "id": "beddf48e-46a5-41af-aa29-894ad0fa1a35",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Breads; item: Gluten-Free Bread; price: $6. 50; description: Made with almond and rice flour for gluten-sensitive customers.",
+    "source": "menu.csv#row_5",
+    "timestamp": "2025-08-13T10:51:14.042538"
+  },
+  {
+    "id": "af4476d3-70ae-4aea-8592-a5e3dd987009",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Pastries; item: Croissant; price: $3. 25; description: Buttery, flaky croissant baked fresh each morning.",
+    "source": "menu.csv#row_6",
+    "timestamp": "2025-08-13T10:51:14.042599"
+  },
+  {
+    "id": "2491c00c-0da6-4ab8-816d-6e36bc22937f",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Pastries; item: Chocolate Croissant; price: $4. 25; description: Croissant filled with dark chocolate chunks.",
+    "source": "menu.csv#row_7",
+    "timestamp": "2025-08-13T10:51:14.042641"
+  },
+  {
+    "id": "1cb8c5cc-f362-44e3-a4ed-58a7d7bb640d",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Pastries; item: Apple Danish; price: $4. 50; description: Flaky pastry with cinnamon-spiced apples and cream cheese.",
+    "source": "menu.csv#row_8",
+    "timestamp": "2025-08-13T10:51:14.042678"
+  },
+  {
+    "id": "7ae6f2a7-35bc-4f5e-a124-246ed1c450bc",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Pastries; item: Blueberry Muffin; price: $3. 00; description: Moist muffin packed with fresh blueberries.",
+    "source": "menu.csv#row_9",
+    "timestamp": "2025-08-13T10:51:14.042713"
+  },
+  {
+    "id": "3fdab50f-bb60-435e-95d5-5792c476ed83",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Pastries; item: Cinnamon Roll; price: $3. 75; description: Sweet roll with cinnamon sugar and cream cheese frosting.",
+    "source": "menu.csv#row_10",
+    "timestamp": "2025-08-13T10:51:14.042749"
+  },
+  {
+    "id": "50f5d948-d444-4140-94c8-bfe573096bdf",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Cakes; item: Chocolate Fudge Cake; price: $25. 00; description: Rich chocolate cake with fudge frosting, serves 8-10 people.",
+    "source": "menu.csv#row_11",
+    "timestamp": "2025-08-13T10:51:14.042784"
+  },
+  {
+    "id": "ab165d89-8919-4072-bf6c-f78ff2474fa5",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Cakes; item: Carrot Cake; price: $22. 00; description: Spiced carrot cake with cream cheese frosting and walnuts.",
+    "source": "menu.csv#row_12",
+    "timestamp": "2025-08-13T10:51:14.042819"
+  },
+  {
+    "id": "05fbb680-b6e0-4d57-a42b-bfe9fb0f7fd5",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Cakes; item: Cheesecake; price: $20. 00; description: Classic New York-style cheesecake with graham cracker crust.",
+    "source": "menu.csv#row_13",
+    "timestamp": "2025-08-13T10:51:14.042854"
+  },
+  {
+    "id": "5aea179f-5d17-4756-93db-3ff236ce9f7e",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Cakes; item: Red Velvet Cake; price: $24. 00; description: Velvety red cake with cream cheese frosting, serves 8-10 people.",
+    "source": "menu.csv#row_14",
+    "timestamp": "2025-08-13T10:51:14.042888"
+  },
+  {
+    "id": "f2a7336d-2f36-4ab8-bf15-f662ccae740c",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Cakes; item: Gluten-Free Chocolate Cake; price: $27. 00; description: Decadent chocolate cake for gluten-sensitive customers.",
+    "source": "menu.csv#row_15",
+    "timestamp": "2025-08-13T10:51:14.042923"
+  },
+  {
+    "id": "2c946f80-fe2c-4dab-b7c1-15018f1537c4",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Specialty; item: Sandwich Platter; price: $35. 00; description: Assorted sandwiches with choice of 6 fresh breads, serves 4-6 people.",
+    "source": "menu.csv#row_16",
+    "timestamp": "2025-08-13T10:51:14.042958"
+  },
+  {
+    "id": "7ee2c97e-6166-41d3-b44c-54f8c49026a8",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Specialty; item: Cheese Platter; price: $30. 00; description: Selection of local cheeses with crackers and fruit, serves 4-6 people.",
+    "source": "menu.csv#row_17",
+    "timestamp": "2025-08-13T10:51:14.043003"
+  },
+  {
+    "id": "89cf064f-2638-41dc-a028-232eb1588d36",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Specialty; item: Cookie Assortment; price: $18. 00; description: Box of 12 assorted cookies including chocolate chip, oatmeal, and sugar cookies.",
+    "source": "menu.csv#row_18",
+    "timestamp": "2025-08-13T10:51:14.043040"
+  },
+  {
+    "id": "1f5104c6-9edf-4c88-a0d0-46129ff6381f",
+    "branch": "main",
+    "category": "menu",
+    "text": "category: Specialty; item: Bread Basket; price: $15. 00; description: Selection of 4 fresh breads including baguette, sourdough, and rolls.",
+    "source": "menu.csv#row_19",
+    "timestamp": "2025-08-13T10:51:14.043128"
+  },
+  {
+    "id": "8c6c32e4-83d0-47e1-945e-0d0d5033e3d2",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: What are your hours. ; answer: We are open Monday through Friday from 6am to 8pm, Saturday from 7am to 9pm, and Sunday from 7am to 6pm. All our locations follow the same hours.",
+    "source": "faq.json#item_1",
+    "timestamp": "2025-08-13T10:51:14.043352"
+  },
+  {
+    "id": "12f8a629-6d6a-4143-ad07-fd6165b25d5b",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: Do you offer delivery. ; answer: Yes, we offer delivery within a 5-mile radius for orders over $30. Delivery fee is $5 for orders under $50 and free for orders over $50. Same-day delivery is available for orders placed before 2pm.",
+    "source": "faq.json#item_2",
+    "timestamp": "2025-08-13T10:51:14.043396"
+  },
+  {
+    "id": "4c030540-0d7b-4285-899e-ea5b73f0dc68",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: Can I place custom orders. ; answer: Yes, we accept custom cake orders with at least 48 hours notice. For wedding cakes and large orders, we recommend booking 2-3 weeks in advance. Please call our Downtown branch at (555) 123-4567 to discuss your requirements.",
+    "source": "faq.json#item_3",
+    "timestamp": "2025-08-13T10:51:14.043434"
+  },
+  {
+    "id": "93a5085e-a336-4d19-92e9-3a17f5cb7721",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: Do you have gluten-free options. ; answer: Yes, we offer a selection of gluten-free products including bread, cakes, and pastries. These items are clearly marked and prepared in a dedicated area to prevent cross-contamination.",
+    "source": "faq.json#item_4",
+    "timestamp": "2025-08-13T10:51:14.043468"
+  },
+  {
+    "id": "292cb392-64f4-4d03-9dac-b64d24144e01",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: How fresh is your bread. ; answer: All our bread is baked fresh daily. We start baking at 4am each morning to ensure our customers get the freshest products possible. Any unsold bread at the end of the day is donated to local food banks.",
+    "source": "faq.json#item_5",
+    "timestamp": "2025-08-13T10:51:14.043503"
+  },
+  {
+    "id": "5586d2b4-b946-43d0-be5f-7817b567c9e2",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: Do you offer catering services. ; answer: Yes, we provide catering services for events, parties, and corporate functions. We can create custom cakes, bread baskets, and pastry assortments. Minimum order of $100 required for catering services. Please contact us at least one week in advance for large orders.",
+    "source": "faq.json#item_6",
+    "timestamp": "2025-08-13T10:51:14.043543"
+  },
+  {
+    "id": "b10faf2c-08f7-411c-bd1a-5a999b34ccc2",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: What payment methods do you accept. ; answer: We accept cash, all major credit cards, Apple Pay, and Google Pay. For orders over $50, we also offer payment plans through our partnership with local financing services.",
+    "source": "faq.json#item_7",
+    "timestamp": "2025-08-13T10:51:14.043576"
+  },
+  {
+    "id": "37e0379a-af9d-4bd2-95c1-4c34da08f0fa",
+    "branch": "main",
+    "category": "faq",
+    "text": "question: Do you have vegan options. ; answer: Yes, we offer several vegan products including our vegan sourdough bread, vegan croissants, and a selection of vegan cookies. These items are clearly marked and made without any animal products.",
+    "source": "faq.json#item_8",
+    "timestamp": "2025-08-13T10:51:14.043609"
+  }
+]

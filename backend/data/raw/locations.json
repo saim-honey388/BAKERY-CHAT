@@ -1,0 +1,29 @@
+[
+  {
+    "name": "Downtown Location",
+    "address": "123 Main Street, Downtown District",
+    "hours": "Monday-Friday 6am-8pm, Saturday 7am-9pm, Sunday 7am-6pm",
+    "phone": "(555) 123-4567",
+    "manager": "Sarah Johnson",
+    "parking": "Street parking and nearby public garage",
+    "services": ["Delivery", "Catering", "Special Orders"]
+  },
+  {
+    "name": "Westside Location",
+    "address": "456 Oak Avenue, Westside Shopping Center",
+    "hours": "Monday-Saturday 6am-9pm, Sunday 7am-6pm",
+    "phone": "(555) 987-6543",
+    "manager": "Michael Chen",
+    "parking": "Free parking in shopping center lot",
+    "services": ["Catering", "Special Orders"]
+  },
+  {
+    "name": "Mall Location",
+    "address": "789 Shopping Mall, Level 1, Food Court",
+    "hours": "Monday-Sunday 8am-10pm (follows mall hours)",
+    "phone": "(555) 456-7890",
+    "manager": "Jennifer Williams",
+    "parking": "Mall parking facilities",
+    "services": ["Special Orders"]
+  }
+]
