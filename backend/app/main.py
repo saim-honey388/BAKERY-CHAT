@@ -21,6 +21,7 @@ from .rerank import Reranker
 from .prompt_builder import PromptBuilder
 from .generate import GenerationClient
 from .postprocess import Postprocessor
+from .controller import Controller
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -47,6 +48,7 @@ reranker = Reranker()
 prompt_builder = PromptBuilder()
 gen_client = GenerationClient()
 postprocessor = Postprocessor()
+controller = Controller()
 
 class QueryRequest(BaseModel):
     """Request model for chat queries."""
@@ -95,72 +97,28 @@ async def create_session(request: SessionCreateRequest):
 @app.post("/query", response_model=QueryResponse)
 async def query_chatbot(request: QueryRequest):
     """
-    Process a chat query using the RAG pipeline.
-    
-    Args:
-        request: Query request with session ID and query text
-        
-    Returns:
-        Query response with answer and citations
+    Process a chat query using the Controller orchestration.
     """
     try:
-        # Preprocess query
-        print(f"DEBUG: Processing query for session {request.session_id}: {request.query}", flush=True)
-        preprocessed = preprocessor.preprocess_query(request.query)
-        print(f"DEBUG: Preprocessed query: {preprocessed}", flush=True)
-        
-        # Add user message to session
-        session_manager.add_message(request.session_id, "user", request.query)
-        print(f"DEBUG: Added user message to session {request.session_id}", flush=True)
-        
-        # Retrieve context documents
-        print(f"DEBUG: Retrieving context documents for: {preprocessed['preprocessed']}", flush=True)
-        retrieved_docs = retriever.hybrid_search(preprocessed["preprocessed"], k=10)
-        print(f"DEBUG: Retrieved {len(retrieved_docs)} documents", flush=True)
-        
-        # Rerank documents
-        print(f"DEBUG: Reranking {len(retrieved_docs)} documents", flush=True)
-        reranked_docs = reranker.rerank(preprocessed["preprocessed"], retrieved_docs, k=5)
-        print(f"DEBUG: Reranked to {len(reranked_docs)} documents", flush=True)
-        
-        # Get conversation context
-        conversation_context = session_manager.get_conversation_context(request.session_id)
-        print(f"DEBUG: Conversation context length: {len(conversation_context)}", flush=True)
-        
-        # Build prompt
-        print(f"DEBUG: Building prompt with {len(reranked_docs)} documents", flush=True)
-        prompt = prompt_builder.build_prompt(
-            preprocessed["preprocessed"],
-            reranked_docs,
-            conversation_context
-        )
-        print(f"DEBUG: Prompt built, length: {len(prompt)}", flush=True)
-        
-        # Generate answer
-        print(f"DEBUG: Generating answer with LLM", flush=True)
-        answer = gen_client.generate_answer(prompt)
-        print(f"DEBUG: Generated answer, length: {len(answer)}", flush=True)
-        
-        # Format citations
-        citations = prompt_builder.format_citations(reranked_docs)
-        print(f"DEBUG: Formatted {len(citations)} citations", flush=True)
-        
-        # Postprocess response
-        result = postprocessor.process_response(answer, citations)
-        print(f"DEBUG: Postprocessed response", flush=True)
-        
-        # Add assistant message to session
-        session_manager.add_message(request.session_id, "assistant", result["response"])
-        print(f"DEBUG: Added assistant message to session {request.session_id}", flush=True)
-        
-        # Return response
-        print(f"DEBUG: Returning response for session {request.session_id}", flush=True)
-        return QueryResponse(
-            session_id=request.session_id,
-            response=result["response"],
-            citations=result["citations"]
-        )
-        
+        print(f"DEBUG: Controller handling query for session {request.session_id}: {request.query}", flush=True)
+        # Decide whether to call the LLM: prefer explicit USE_LLM env var, else require a non-test GROQ_API_KEY
+        use_llm_env = os.getenv("USE_LLM", "false").lower() in ("1", "true", "yes")
+        groq_key = Config.GROQ_API_KEY
+        has_real_key = bool(groq_key) and groq_key not in ("test", "dev")
+        call_llm = use_llm_env or has_real_key
+        result = controller.handle_query(request.session_id, request.query, skip_llm=not call_llm)
+
+        response_text = result.get("response", "")
+        citations = result.get("citations", [])
+
+        # Add assistant message to session (controller already does this, but keep idempotent)
+        try:
+            session_manager.add_message(request.session_id, "assistant", response_text)
+        except Exception:
+            pass
+
+        return QueryResponse(session_id=request.session_id, response=response_text, citations=citations)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 

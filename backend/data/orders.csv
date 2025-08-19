@@ -1,0 +1,6 @@
+item,quantity,time,pickup_or_delivery,order_id
+croissant,2,2 ,pickup,BK-16738
+croissant,2,2025-08-19T17:00:00,pickup,BK-46022
+croissant,2,2025-08-19T17:00:00,pickup,BK-51540
+croissant,2,2025-08-19T17:00:00,pickup,BK-85884
+croissant,2,2025-08-19T17:00:00,pickup,BK-18393

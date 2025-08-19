@@ -1,0 +1,103 @@
+"""Controller / Orchestrator to route queries to agents and manage NLU.
+
+This is an initial implementation that uses rule-based NLU and agents stubs.
+"""
+from typing import Dict, Any, List
+from ..nlu.rules import rule_based_intents
+from ..nlu.llm_router import llm_route
+from ..nlu.entity_extractor import EntityExtractor
+from ..agents.general_info_agent import GeneralInfoAgent
+from ..agents.product_info_agent import ProductInfoAgent
+from ..agents.order_agent import OrderAgent
+from ..agents.meta_agent import MetaAgent
+from .session import SessionManager
+from ..schemas.io_models import AgentResult
+from .prompt_builder import PromptBuilder
+
+AGENT_MAP = {
+    "general_info": GeneralInfoAgent(),
+    "product_info": ProductInfoAgent(),
+    "order": OrderAgent(),
+    "meta": MetaAgent(),
+}
+
+class Controller:
+    def __init__(self):
+        self.intent_model = None
+        # instantiate a small rule-based extractor for test/production routing
+        self.entity_extractor = EntityExtractor()
+        self.session_manager = SessionManager()
+        self.builder = PromptBuilder()
+
+    def _format_facts_text(self, results: List[AgentResult]) -> str:
+        """Create a simple readable text representation of agent facts for test mode."""
+        blocks = []
+        for r in results:
+            blocks.append(f"[{r.agent}] {r.facts}")
+        return "\n\n".join(blocks)
+
+    def handle_query(self, session_id: str, query: str, skip_llm: bool = False) -> Dict[str, Any]:
+        # save user message
+        self.session_manager.add_message(session_id, "user", query)
+
+        # routing: rules first
+        intents = rule_based_intents(query)
+        if not intents:
+            routed = llm_route(query)
+            intents = routed.get("intents", ["general_info"]) if isinstance(routed, dict) else ["general_info"]
+
+        # extract entities once and pass them into agents via the conversation list
+        extracted = self.entity_extractor.extract(query) if self.entity_extractor else {}
+
+        # call agents
+        results: List[AgentResult] = []
+        for intent in intents:
+            agent = AGENT_MAP.get(intent)
+            if not agent:
+                continue
+            # obtain conversation context and append an 'nlu' message containing extracted entities
+            session_ctx = list(self.session_manager.get_conversation_context(session_id))
+            # append a non-persistent local marker so agents can read entities from the last message
+            session_with_entities = session_ctx + [{"role": "nlu", "message": extracted}]
+            res = agent.handle(query, session=session_with_entities)
+            results.append(res)
+
+        if not results:
+            results = [AGENT_MAP["general_info"].handle(query, session=self.session_manager.get_conversation_context(session_id))]
+
+        # If skip_llm/test mode: return merged facts and citations without calling the LLM
+        if skip_llm:
+            # build readable facts block and collect citations
+            facts_text = self._format_facts_text(results)
+            citations = []
+            for r in results:
+                for c in getattr(r, "citations", []):
+                    citations.append({"source": c.source, "snippet": c.snippet})
+
+            # save assistant message as the facts text for record
+            self.session_manager.add_message(session_id, "assistant", facts_text)
+
+            return {"response": facts_text, "citations": citations, "intents": intents}
+
+        # regular flow: merge facts into FACTS blocks and call LLM
+        facts_blocks = []
+        merged_context_docs = []
+        for r in results:
+            facts_blocks.append(f"[{r.agent}] {r.facts}")
+            merged_context_docs.extend(getattr(r, "context_docs", []))
+
+        conversation_history = "\n".join([f"{m['role']}: {m['message']}" for m in self.session_manager.get_conversation_context(session_id)])
+
+        prompt = self.builder.build_prompt(query=query, context_docs=merged_context_docs, conversation_history=conversation_history + "\n\nFACTS:\n" + "\n".join(facts_blocks))
+        final_text = self.builder.llm_generate(prompt)
+
+        # save assistant response
+        self.session_manager.add_message(session_id, "assistant", final_text)
+
+        # collect citations
+        citations = []
+        for r in results:
+            for c in getattr(r, "citations", []):
+                citations.append({"source": c.source, "snippet": c.snippet})
+
+        return {"response": final_text, "citations": citations, "intents": intents}

@@ -15,19 +15,24 @@ class SessionManager:
     """Manages user sessions and conversation context."""
     
     def __init__(self):
-        """Initialize the session manager with Redis connection."""
-        self.redis_client = redis.Redis(
-            host=Config.REDIS_HOST,
-            port=Config.REDIS_PORT,
-            db=Config.REDIS_DB,
-            decode_responses=True
-        )
+        """Initialize the session manager with Redis connection or fallback to in-memory."""
+        self.use_redis = True
+        self.memory_sessions = {}  # Fallback in-memory storage
         
-        # Test Redis connection
         try:
+            self.redis_client = redis.Redis(
+                host=Config.REDIS_HOST,
+                port=Config.REDIS_PORT,
+                db=Config.REDIS_DB,
+                decode_responses=True
+            )
+            # Test Redis connection
             self.redis_client.ping()
-        except redis.ConnectionError:
-            raise ConnectionError("Could not connect to Redis server")
+            print("DEBUG: Using Redis for session storage", flush=True)
+        except (redis.ConnectionError, Exception) as e:
+            print(f"DEBUG: Redis not available ({e}), using in-memory session storage", flush=True)
+            self.use_redis = False
+            self.redis_client = None
     
     def _get_session_key(self, session_id: str) -> str:
         """
@@ -51,22 +56,35 @@ class SessionManager:
         Returns:
             True if session was created, False if it already exists
         """
-        session_key = self._get_session_key(session_id)
-        
-        # Check if session already exists
-        if self.redis_client.exists(session_key):
-            return False
-        
-        # Create empty session
-        session_data = {
-            "messages": [],
-            "summary": "",
-            "created_at": datetime.now().isoformat(),
-            "last_updated": datetime.now().isoformat()
-        }
-        
-        self.redis_client.set(session_key, json.dumps(session_data))
-        return True
+        if self.use_redis:
+            session_key = self._get_session_key(session_id)
+            
+            # Check if session already exists
+            if self.redis_client.exists(session_key):
+                return False
+            
+            # Create empty session
+            session_data = {
+                "messages": [],
+                "summary": "",
+                "created_at": datetime.now().isoformat(),
+                "last_updated": datetime.now().isoformat()
+            }
+            
+            self.redis_client.set(session_key, json.dumps(session_data))
+            return True
+        else:
+            # In-memory fallback
+            if session_id in self.memory_sessions:
+                return False
+            
+            self.memory_sessions[session_id] = {
+                "messages": [],
+                "summary": "",
+                "created_at": datetime.now().isoformat(),
+                "last_updated": datetime.now().isoformat()
+            }
+            return True
     
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -78,12 +96,15 @@ class SessionManager:
         Returns:
             Session data or None if not found
         """
-        session_key = self._get_session_key(session_id)
-        
-        session_data = self.redis_client.get(session_key)
-        if session_data:
-            return json.loads(session_data)
-        return None
+        if self.use_redis:
+            session_key = self._get_session_key(session_id)
+            session_data = self.redis_client.get(session_key)
+            if session_data:
+                return json.loads(session_data)
+            return None
+        else:
+            # In-memory fallback
+            return self.memory_sessions.get(session_id)
     
     def add_message(self, session_id: str, role: str, text: str) -> bool:
         """
@@ -97,12 +118,14 @@ class SessionManager:
         Returns:
             True if successful, False otherwise
         """
-        session_key = self._get_session_key(session_id)
-        
         # Get current session data
         session_data = self.get_session(session_id)
         if not session_data:
-            return False
+            # Auto-create session if it doesn't exist
+            self.create_session(session_id)
+            session_data = self.get_session(session_id)
+            if not session_data:
+                return False
         
         # Add new message
         message = {
@@ -114,8 +137,14 @@ class SessionManager:
         session_data["messages"].append(message)
         session_data["last_updated"] = datetime.now().isoformat()
         
-        # Update session in Redis
-        self.redis_client.set(session_key, json.dumps(session_data))
+        # Update session
+        if self.use_redis:
+            session_key = self._get_session_key(session_id)
+            self.redis_client.set(session_key, json.dumps(session_data))
+        else:
+            # In-memory: session_data is already a reference to the stored data
+            pass
+        
         return True
     
     def get_recent_messages(self, session_id: str, max_messages: int = 5) -> List[Dict[str, str]]:
@@ -137,33 +166,34 @@ class SessionManager:
         messages = session_data.get("messages", [])
         return messages[-max_messages:] if messages else []
     
-    def get_conversation_context(self, session_id: str) -> str:
+    def get_conversation_context(self, session_id: str) -> List[Dict[str, str]]:
         """
-        Get conversation context as a formatted string.
+        Get conversation context as a list of message dictionaries.
         
         Args:
             session_id: Unique session identifier
             
         Returns:
-            Formatted conversation context
+            List of message dictionaries with 'role' and 'message' keys
         """
         print(f"DEBUG: Getting conversation context for session {session_id}", flush=True)
         messages = self.get_recent_messages(session_id, Config.MAX_CONVERSATION_TURNS)
         print(f"DEBUG: Retrieved {len(messages)} recent messages", flush=True)
         
         if not messages:
-            print("DEBUG: No messages found, returning empty context", flush=True)
-            return ""
+            print("DEBUG: No messages found, returning empty list", flush=True)
+            return []
         
-        context_lines = ["Conversation so far:"]
+        # Convert to the format expected by agents
+        context = []
         for message in messages:
-            role = message["role"]
-            text = message["text"]
-            context_lines.append(f"{role}: {text}")
+            context.append({
+                "role": message["role"],
+                "message": message["text"]
+            })
         
-        result = "\n".join(context_lines)
-        print(f"DEBUG: Formatted conversation context, length: {len(result)}", flush=True)
-        return result
+        print(f"DEBUG: Formatted conversation context, length: {len(context)}", flush=True)
+        return context
     
     def update_summary(self, session_id: str, summary: str) -> bool:
         """
@@ -176,8 +206,6 @@ class SessionManager:
         Returns:
             True if successful, False otherwise
         """
-        session_key = self._get_session_key(session_id)
-        
         # Get current session data
         session_data = self.get_session(session_id)
         if not session_data:
@@ -186,8 +214,14 @@ class SessionManager:
         session_data["summary"] = summary
         session_data["last_updated"] = datetime.now().isoformat()
         
-        # Update session in Redis
-        self.redis_client.set(session_key, json.dumps(session_data))
+        # Update session
+        if self.use_redis:
+            session_key = self._get_session_key(session_id)
+            self.redis_client.set(session_key, json.dumps(session_data))
+        else:
+            # In-memory: session_data is already a reference to the stored data
+            pass
+        
         return True
     
     def get_summary(self, session_id: str) -> str:
@@ -216,8 +250,15 @@ class SessionManager:
         Returns:
             True if successful, False otherwise
         """
-        session_key = self._get_session_key(session_id)
-        return bool(self.redis_client.delete(session_key))
+        if self.use_redis:
+            session_key = self._get_session_key(session_id)
+            return bool(self.redis_client.delete(session_key))
+        else:
+            # In-memory fallback
+            if session_id in self.memory_sessions:
+                del self.memory_sessions[session_id]
+                return True
+            return False
 
 def main():
     """Main function for testing the session manager."""

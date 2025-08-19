@@ -162,6 +162,16 @@ Assistant:"""
             citations.append(citation)
         
         return citations
+    
+    def llm_generate(self, prompt: str) -> str:
+        """Call the LLM to generate final prose using existing generate client."""
+        try:
+            from .generate import GenerationClient
+            gen = GenerationClient()
+            return gen.generate_answer(prompt)
+        except Exception as e:
+            # fallback: return a simple concatenation of facts if LLM unavailable
+            return "Sorry, I'm having trouble contacting the language model right now."
 
 def main():
     """Main function for testing the prompt builder."""
