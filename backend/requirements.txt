@@ -8,3 +8,4 @@ whoosh==2.7.4
 sentence-transformers==5.1.0
 numpy==2.2.6
 pydantic==2.11.7
+sqlalchemy==2.0.31

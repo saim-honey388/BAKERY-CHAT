@@ -139,7 +139,7 @@ Assistant:"""
             query=query
         )
         print(f"DEBUG: Prompt built, total length: {len(prompt)}", flush=True)
-        
+        print("-"*50 + "\n[WORKFLOW] 5a. FINAL PROMPT:\n" + prompt + "\n" + "-"*50)
         return prompt
     
     def format_citations(self, context_docs: List[Dict[str, Any]]) -> List[Dict[str, str]]:

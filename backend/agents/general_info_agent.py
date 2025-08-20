@@ -13,6 +13,7 @@ class GeneralInfoAgent(BaseAgent):
         pass
 
     def handle(self, query: str, session: Dict[str, Any]):
+        print(f"[WORKFLOW] Executing GeneralInfoAgent...")
         q = query.lower()
         # simple rules for quick facts
         if "hours" in q or "open" in q or "close" in q:

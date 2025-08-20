@@ -37,19 +37,27 @@ class Controller:
         return "\n\n".join(blocks)
 
     def handle_query(self, session_id: str, query: str, skip_llm: bool = False) -> Dict[str, Any]:
+        print("\n" + "="*50)
+        print(f"[WORKFLOW] 1. Controller received query: '{query}'")
         # save user message
         self.session_manager.add_message(session_id, "user", query)
 
         # routing: rules first
+        print("[WORKFLOW] 2. Detecting intent...")
         intents = rule_based_intents(query)
         if not intents:
+            print("[WORKFLOW] 2a. No rule-based intent found, trying LLM router...")
             routed = llm_route(query)
             intents = routed.get("intents", ["general_info"]) if isinstance(routed, dict) else ["general_info"]
+        print(f"[WORKFLOW] 2b. Intent(s) detected: {intents}")
 
         # extract entities once and pass them into agents via the conversation list
+        print("[WORKFLOW] 3. Extracting entities...")
         extracted = self.entity_extractor.extract(query) if self.entity_extractor else {}
+        print(f"[WORKFLOW] 3a. Entities extracted: {extracted}")
 
         # call agents
+        print("[WORKFLOW] 4. Dispatching to agent(s)...")
         results: List[AgentResult] = []
         for intent in intents:
             agent = AGENT_MAP.get(intent)
@@ -59,8 +67,10 @@ class Controller:
             session_ctx = list(self.session_manager.get_conversation_context(session_id))
             # append a non-persistent local marker so agents can read entities from the last message
             session_with_entities = session_ctx + [{"role": "nlu", "message": extracted}]
+            print(f"[WORKFLOW] 4a. Calling agent: '{agent.name}' for intent '{intent}'")
             res = agent.handle(query, session=session_with_entities)
             results.append(res)
+            print(f"[WORKFLOW] 4b. Agent '{agent.name}' returned facts: {res.facts}")
 
         if not results:
             results = [AGENT_MAP["general_info"].handle(query, session=self.session_manager.get_conversation_context(session_id))]
@@ -88,7 +98,10 @@ class Controller:
 
         conversation_history = "\n".join([f"{m['role']}: {m['message']}" for m in self.session_manager.get_conversation_context(session_id)])
 
+        print("[WORKFLOW] 5. Building prompt...")
         prompt = self.builder.build_prompt(query=query, context_docs=merged_context_docs, conversation_history=conversation_history + "\n\nFACTS:\n" + "\n".join(facts_blocks))
+
+        print("[WORKFLOW] 6. Generating final response with LLM...")
         final_text = self.builder.llm_generate(prompt)
 
         # save assistant response
@@ -100,4 +113,6 @@ class Controller:
             for c in getattr(r, "citations", []):
                 citations.append({"source": c.source, "snippet": c.snippet})
 
+        print(f"[WORKFLOW] 7. Final response generated.")
+        print("="*50 + "\n")
         return {"response": final_text, "citations": citations, "intents": intents}

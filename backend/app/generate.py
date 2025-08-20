@@ -66,6 +66,7 @@ class GenerationClient:
             
             # Extract answer from response
             answer = data["choices"][0]["message"]["content"].strip()
+            print(f"[WORKFLOW] 6a. LLM Raw Response:\n{answer}")
             print(f"DEBUG: Extracted answer, length: {len(answer)}", flush=True)
             return answer
             

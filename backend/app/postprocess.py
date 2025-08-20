@@ -72,6 +72,8 @@ class Postprocessor:
         result = self.add_citations(formatted_response, citations)
         print(f"DEBUG: Added {len(citations)} citations", flush=True)
         
+        print(f"[WORKFLOW] 6b. Post-processed response:\n{formatted_response}")
+        print(f"DEBUG: Post-processed text length: {len(formatted_response)}", flush=True)
         print(f"DEBUG: Postprocessing complete", flush=True)
         return result
 

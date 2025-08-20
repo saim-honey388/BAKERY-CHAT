@@ -15,7 +15,11 @@ class BaseAgent(ABC):
         return AgentResult(agent=self.name, intent=intent, facts=facts, **extras)
 
     def _clarify(self, intent: str, question: str) -> AgentResult:
+        print(f"[CLARIFY] for intent '{intent}': {question}")
         return AgentResult(
-            agent=self.name, intent=intent, facts={},
-            needs_clarification=True, clarification_question=question
+            agent=self.name,
+            status="clarify",
+            intent=intent,
+            clarification=question,
+            facts={}
         )
