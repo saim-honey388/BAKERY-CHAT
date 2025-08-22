@@ -12,7 +12,7 @@ class ProductInfoAgent(BaseAgent):
     def __init__(self):
         pass
 
-    def handle(self, query: str, session: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def handle(self, session_id: str, query: str, session: List[Dict[str, Any]]) -> Dict[str, Any]:
         print(f"[WORKFLOW] Executing ProductInfoAgent...")
         db = SessionLocal()
         try:

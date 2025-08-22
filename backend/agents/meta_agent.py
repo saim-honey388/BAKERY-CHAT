@@ -7,7 +7,7 @@ class MetaAgent(BaseAgent):
     def __init__(self):
         pass
 
-    def handle(self, query: str, session: List[Dict[str, str]] = []) -> Any:
+    def handle(self, session_id: str, query: str, session: List[Dict[str, str]] = []) -> Any:
         print(f"[WORKFLOW] Executing MetaAgent...")
         q = query.lower()
         if "who are you" in q:

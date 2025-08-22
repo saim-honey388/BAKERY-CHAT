@@ -12,7 +12,7 @@ class GeneralInfoAgent(BaseAgent):
     def __init__(self):
         pass
 
-    def handle(self, query: str, session: Dict[str, Any]):
+    def handle(self, session_id: str, query: str, session: Dict[str, Any]):
         print(f"[WORKFLOW] Executing GeneralInfoAgent...")
         q = query.lower()
         # simple rules for quick facts
