@@ -43,6 +43,7 @@ class Order(Base):
     order_date = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(Enum(OrderStatus), nullable=False, default=OrderStatus.pending)
     pickup_or_delivery = Column(Enum(FulfillmentType), nullable=False)
+    total_amount = Column(Float, nullable=True)  # Added field to store total order amount
 
     customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order")

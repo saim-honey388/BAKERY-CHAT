@@ -5,9 +5,10 @@ from typing import List
 
 GENERAL = ["hours", "timings", "timmings", "open", "close", "location",
            "branch", "branches", "operate", "serve", "deliver", "delivery", "policy", "policies"]
-PRODUCT = ["menu", "cake", "pastry", "bread", "cupcake", "brownie",
+PRODUCT = ["menu", "pastry", "bread", "cupcake", "brownie",
            "chocolate", "flavor", "price", "prices", "recommend", "suggest", "best", "list", "available"]
-ORDER   = ["order", "buy", "book", "reserve", "pickup", "pick up", "deliver", "delivery", "place an order"]
+ORDER   = ["order", "buy", "book", "reserve", "pickup", "pick up", "deliver", "delivery", "place an order",
+           "add", "cart", "want", "get", "take", "cake", "cakes", "cheesecake", "croissant"]
 
 
 def _contains_any(q: str, vocab: List[str]) -> bool:

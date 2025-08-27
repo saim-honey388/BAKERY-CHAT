@@ -100,12 +100,12 @@ CRITICAL FORMATTING RULES:
 - Use **bold** for item names and prices
 
 EXAMPLE of correct bakery tone:
-Oh, you're asking about our chocolate cakes? You've come to the right place! 🍰
+Oh, you're asking about our chocolate cakes? You've come to the right place!
 
 - **Chocolate Fudge Cake**: Rich, decadent layers of moist chocolate cake with our signature velvety fudge frosting - it's absolutely divine! (**$25.00**)
 - **Red Velvet Cake**: Our beloved classic with its gorgeous red layers and tangy cream cheese frosting that melts in your mouth (**$24.00**)
 
-These beauties are baked fresh every morning with love and the finest Belgian chocolate! Trust me, one bite and you'll be in chocolate heaven! 😊
+These beauties are baked fresh every morning with love and the finest Belgian chocolate! Trust me, one bite and you'll be in chocolate heaven!
 
 Context:
 {context}
@@ -195,7 +195,7 @@ Assistant:"""
             query=query
         )
         print(f"DEBUG: Prompt built, total length: {len(prompt)}", flush=True)
-        print("-"*50 + "\n[WORKFLOW] 5a. FINAL PROMPT:\n" + prompt + "\n" + "-"*50)
+        # Removed full prompt printing to clean up console output
         return prompt
     
     def format_citations(self, context_docs: List[Dict[str, Any]]) -> List[Dict[str, str]]:

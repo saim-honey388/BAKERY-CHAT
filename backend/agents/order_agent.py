@@ -232,35 +232,45 @@ class OrderAgent(BaseAgent):
 
     def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str) -> Dict[str, Any]:
         """Single gateway for order finalization - called from one place only."""
+        print("DEBUG: Entering _finalize_order method.")
+        print(f"DEBUG: Cart state before finalization: {cart.__dict__}")
+
         if not cart.items:
+            print("DEBUG: Cart is empty. Cannot finalize order.")
             return {"order_placed": False, "note": "Your cart is empty. Please add some items before confirming."}
-        
+
         # Final stock check
         for item in cart.items:
             product = item['product']
+            print(f"DEBUG: Checking stock for product {product.name}. Available: {product.quantity_in_stock}, Needed: {item['quantity']}")
             if product.quantity_in_stock < item['quantity']:
+                print(f"DEBUG: Insufficient stock for product {product.name}.")
                 return {
                     "order_placed": False, 
                     "note": f"Sorry, we only have {product.quantity_in_stock} {product.name} in stock. Would you like to adjust your order?"
                 }
-        
+
+        print("DEBUG: Stock check passed. Proceeding to create customer and order.")
+
         # Create customer
         customer = self._find_or_create_customer(
             db, session_id, 
             cart.customer_info.get('name'), 
             cart.customer_info.get('phone_number')
         )
-        
+        print(f"DEBUG: Customer created or found. Customer ID: {customer.id}")
+
         # Create order
         order = Order(
             customer_id=customer.id,
-            status=OrderStatus.PENDING,
-            pickup_or_delivery=FulfillmentType.PICKUP if cart.fulfillment_type == 'pickup' else FulfillmentType.DELIVERY,
+            status=OrderStatus.pending,
+            pickup_or_delivery=FulfillmentType.pickup if cart.fulfillment_type == 'pickup' else FulfillmentType.delivery,
             total_amount=cart.get_total()
         )
         db.add(order)
         db.flush()
-        
+        print(f"DEBUG: Order created. Order ID: {order.id}")
+
         # Create order items and update inventory
         for item in cart.items:
             product = item['product']
@@ -268,36 +278,253 @@ class OrderAgent(BaseAgent):
                 order_id=order.id,
                 product_id=product.id,
                 quantity=item['quantity'],
-                unit_price=product.price
+                price_at_time_of_order=product.price
             )
             db.add(order_item)
-            
-            # Update inventory
             product.quantity_in_stock -= item['quantity']
-        
+            print(f"DEBUG: Order item created for product {product.name}. Remaining stock: {product.quantity_in_stock}")
+
         # Build receipt
         receipt_cart = OrderAgent.ShoppingCart()
         receipt_cart.items = list(cart.items)
         receipt_cart.fulfillment_type = cart.fulfillment_type
         receipt_cart.customer_info = dict(cart.customer_info)
         receipt_cart.payment_method = cart.payment_method
-        
+
         if cart.fulfillment_type == 'pickup':
             receipt_cart.pickup_info = dict(cart.pickup_info)
         else:
             receipt_cart.delivery_info = dict(cart.delivery_info)
-            
+
         receipt_text = receipt_cart.build_receipt(order_id=order.id) + "\n\nThank you! Your order has been placed successfully. We hope you enjoy your treats!"
-        
+        print("DEBUG: Receipt built.")
+
         # Store receipt for this session
         self.last_receipt_by_session[session_id] = receipt_text
-        
+        print(f"DEBUG: Receipt stored for session {session_id}.")
+
+        # Commit all changes to the database
+        db.commit()
+
         # Clear cart
         cart.clear()
-        
+        print("DEBUG: Cart cleared after order finalization.")
+
         # Console DB snapshot
         self._print_db_status(db)
+
+        print("DEBUG: Order finalized successfully.")
+        return {
+            "order_placed": True,
+            "order_id": order.id,
+            "receipt_text": receipt_text,
+            "note": "Your order has been placed successfully!"
+        }
+
+    # --- New: business hour validation ---
+    @staticmethod
+    def _parse_hour_str_to_time(hour_str: str):
+        from datetime import time
+        import re
+        m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", hour_str.strip(), re.IGNORECASE)
+        if not m:
+            return None
+        hh = int(m.group(1)) % 12
+        mm = int(m.group(2) or 0)
+        if m.group(3).lower() == 'pm':
+            hh += 12
+        return time(hh, mm)
+
+    @staticmethod
+    def _load_locations():
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), "..", "data", "raw", "locations.json")
+        path = os.path.abspath(path)
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    @classmethod
+    def _get_branch_hours_for_datetime(cls, branch_name: str, dt) -> tuple:
+        """Return (open_time, close_time) for the given branch and datetime.date().
+        Falls back to (time(8,0), time(18,0)) if parsing fails.
+        """
+        from datetime import time
+        import re
+        try:
+            locations = cls._load_locations()
+            branch = next((b for b in locations if b.get('name', '').lower().startswith(branch_name.lower())), None)
+            if not branch:
+                return time(8, 0), time(18, 0)
+            hours_str = branch.get('hours', '')
+            weekday = dt.weekday()  # 0=Mon ... 6=Sun
+            # crude rules: check blocks separated by commas
+            blocks = [blk.strip() for blk in hours_str.split(',')]
+            day_label = {0: 'monday', 1: 'tuesday', 2: 'wednesday', 3: 'thursday', 4: 'friday', 5: 'saturday', 6: 'sunday'}[weekday]
+            # pick block that mentions today or a range covering today
+            chosen = None
+            for blk in blocks:
+                low = blk.lower()
+                if 'monday-sunday' in low:
+                    chosen = blk
+                    break
+                if 'monday-friday' in low and weekday <= 4:
+                    chosen = blk
+                if 'saturday' in low and weekday == 5:
+                    chosen = blk
+                if 'sunday' in low and weekday == 6:
+                    chosen = blk
+                if day_label in low:
+                    chosen = blk
+            if not chosen:
+                return time(8, 0), time(18, 0)
+            # extract times like 6am-8pm
+            m = re.search(r"(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*-\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm))", chosen, re.IGNORECASE)
+            if not m:
+                return time(8, 0), time(18, 0)
+            open_t = cls._parse_hour_str_to_time(m.group(1)) or time(8, 0)
+            close_t = cls._parse_hour_str_to_time(m.group(2)) or time(18, 0)
+            return open_t, close_t
+        except Exception:
+            return time(8, 0), time(18, 0)
+
+    @classmethod
+    def _is_time_within_business_hours(cls, iso_timestamp: str, branch_name: str = None) -> bool:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(iso_timestamp)
+            if branch_name:
+                open_t, close_t = cls._get_branch_hours_for_datetime(branch_name, dt)
+            else:
+                from datetime import time
+                open_t, close_t = time(8, 0), time(18, 0)
+            return open_t <= dt.time() <= close_t
+        except Exception:
+            return False
+
+    def __init__(self):
+        self.carts: Dict[str, OrderAgent.ShoppingCart] = {}  # session_id -> ShoppingCart
+        self.last_receipt_by_session: Dict[str, str] = {}  # Store last receipt per session
+        self.entity_extractor = EntityExtractor()
+
+    def get_cart_state(self, session_id: str) -> Dict[str, Any]:
+        cart = self.carts.get(session_id)
+        if not cart:
+            return {"has_cart": False}
+        return {
+            "has_cart": bool(cart.items),
+            "awaiting_fulfillment": cart.awaiting_fulfillment,
+            "awaiting_details": cart.awaiting_details,
+            "awaiting_confirmation": cart.awaiting_confirmation,
+            "cart_items": len(cart.items),
+        }
+
+    def _is_strong_confirmation(self, query: str) -> bool:
+        """Tightened confirmation logic - only strong confirmations when awaiting confirmation."""
+        ql = query.lower().strip()
         
+        # Strong confirmation phrases
+        strong_confirmations = [
+            "yes", "confirm", "place order", "place the order", "place my order",
+            "that's correct", "that is correct", "sounds good", "looks good",
+            "proceed", "go ahead", "finalize", "complete order", "submit order",
+            "yes please", "yes that's right", "yes that is right", "yes place it",
+            "place it", "order it", "buy it", "purchase", "checkout", "finalize order"
+        ]
+        
+        # Negation guard - reject if contains these
+        negation_words = ["not", "wait", "hold on", "change", "add more", "no", "cancel", "stop"]
+        
+        # Check for negation first
+        if any(word in ql for word in negation_words):
+            return False
+            
+        # Check for strong confirmation
+        return any(phrase in ql for phrase in strong_confirmations)
+
+    def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str) -> Dict[str, Any]:
+        """Single gateway for order finalization - called from one place only."""
+        print("DEBUG: Entering _finalize_order method.")
+        print(f"DEBUG: Cart state before finalization: {cart.__dict__}")
+
+        if not cart.items:
+            print("DEBUG: Cart is empty. Cannot finalize order.")
+            return {"order_placed": False, "note": "Your cart is empty. Please add some items before confirming."}
+
+        # Final stock check
+        for item in cart.items:
+            product = item['product']
+            print(f"DEBUG: Checking stock for product {product.name}. Available: {product.quantity_in_stock}, Needed: {item['quantity']}")
+            if product.quantity_in_stock < item['quantity']:
+                print(f"DEBUG: Insufficient stock for product {product.name}.")
+                return {
+                    "order_placed": False, 
+                    "note": f"Sorry, we only have {product.quantity_in_stock} {product.name} in stock. Would you like to adjust your order?"
+                }
+
+        print("DEBUG: Stock check passed. Proceeding to create customer and order.")
+
+        # Create customer
+        customer = self._find_or_create_customer(
+            db, session_id, 
+            cart.customer_info.get('name'), 
+            cart.customer_info.get('phone_number')
+        )
+        print(f"DEBUG: Customer created or found. Customer ID: {customer.id}")
+
+        # Create order
+        order = Order(
+            customer_id=customer.id,
+            status=OrderStatus.pending,
+            pickup_or_delivery=FulfillmentType.pickup if cart.fulfillment_type == 'pickup' else FulfillmentType.delivery,
+            total_amount=cart.get_total()
+        )
+        db.add(order)
+        db.flush()
+        print(f"DEBUG: Order created. Order ID: {order.id}")
+
+        # Create order items and update inventory
+        for item in cart.items:
+            product = item['product']
+            order_item = OrderItem(
+                order_id=order.id,
+                product_id=product.id,
+                quantity=item['quantity'],
+                price_at_time_of_order=product.price
+            )
+            db.add(order_item)
+            product.quantity_in_stock -= item['quantity']
+            print(f"DEBUG: Order item created for product {product.name}. Remaining stock: {product.quantity_in_stock}")
+
+        # Build receipt
+        receipt_cart = OrderAgent.ShoppingCart()
+        receipt_cart.items = list(cart.items)
+        receipt_cart.fulfillment_type = cart.fulfillment_type
+        receipt_cart.customer_info = dict(cart.customer_info)
+        receipt_cart.payment_method = cart.payment_method
+
+        if cart.fulfillment_type == 'pickup':
+            receipt_cart.pickup_info = dict(cart.pickup_info)
+        else:
+            receipt_cart.delivery_info = dict(cart.delivery_info)
+
+        receipt_text = receipt_cart.build_receipt(order_id=order.id) + "\n\nThank you! Your order has been placed successfully. We hope you enjoy your treats!"
+        print("DEBUG: Receipt built.")
+
+        # Store receipt for this session
+        self.last_receipt_by_session[session_id] = receipt_text
+        print(f"DEBUG: Receipt stored for session {session_id}.")
+
+        # Commit all changes to the database
+        db.commit()
+
+        # Clear cart
+        cart.clear()
+        print("DEBUG: Cart cleared after order finalization.")
+
+        # Console DB snapshot
+        self._print_db_status(db)
+
+        print("DEBUG: Order finalized successfully.")
         return {
             "order_placed": True,
             "order_id": order.id,
@@ -389,7 +616,7 @@ class OrderAgent(BaseAgent):
             # Preprocess: lowercased text and early entity extraction to update cart state
             ql = query.lower().strip()
             ent_early = self.entity_extractor.extract(query)
-            if ent_early.get("name"):
+            if ent_early.get("name") and "name" not in cart.customer_info:
                 cart.customer_info["name"] = ent_early["name"]
             if ent_early.get("phone_number"):
                 cart.customer_info["phone_number"] = ent_early["phone_number"]
@@ -592,8 +819,15 @@ class OrderAgent(BaseAgent):
             # If no product in current message, check previous messages for context
             if not product_name:
                 for msg in reversed(session):
-                    if 'chocolate' in msg.get('content', '').lower():
+                    msg_content = msg.get('message', '').lower()
+                    if 'cheesecake' in msg_content or 'cheese cake' in msg_content:
+                        product_name = 'cheesecake'
+                        break
+                    elif 'chocolate' in msg_content:
                         product_name = 'chocolate fudge cake'
+                        break
+                    elif 'croissant' in msg_content:
+                        product_name = 'croissant'
                         break
                 
             print(f"DEBUG: Product name: {product_name}")
@@ -647,8 +881,13 @@ class OrderAgent(BaseAgent):
                     found_items.append((product, quantity))
 
             if not found_items:
-                print("DEBUG: No products detected in query; asking user to specify.")
-                return self._clarify("order", "What item would you like to order?")
+                # Check if we're in an ongoing order context - don't ask for clarification
+                if cart.items or cart.awaiting_fulfillment or cart.awaiting_details or cart.awaiting_confirmation:
+                    # We're in order context but no new products found - continue with existing cart
+                    print("DEBUG: In order context, no new products found, continuing with existing cart.")
+                else:
+                    print("DEBUG: No products detected in query; asking user to specify.")
+                    return self._clarify("order", "What item would you like to order?")
 
             # Stock check for all items first
             for product, qty in found_items:
