@@ -158,10 +158,83 @@ class Controller:
         conversation_history = "\n".join([f"{m['role']}: {m['message']}" for m in self.session_manager.get_conversation_context(session_id)])
 
         print("[WORKFLOW] 5. Building prompt...")
+        # Build enhanced conversation history with FACTS, KNOWN_DETAILS and MISSING_DETAILS
+        # Extract KNOWN/MISSING details if order agent is active
+        known_details_text = ""
+        missing_details_text = ""
+        cart_info_text = ""
+        try:
+            order_agent: OrderAgent = AGENT_MAP.get("order")  # type: ignore
+            cart = order_agent.carts.get(session_id) if order_agent else None
+            if cart:
+                # Include detailed cart information
+                cart_items_text = ""
+                if cart.items:
+                    cart_items = []
+                    for item in cart.items:
+                        cart_items.append(f"{item['quantity']}x {item['product'].name} @ ${item['product'].price}")
+                    cart_items_text = "\n".join(cart_items)
+                else:
+                    cart_items_text = "No items in cart"
+                
+                # Include all cart state information
+                cart_info_text = f"\nCART_STATE:\nItems: {cart_items_text}\nTotal: ${cart.get_total():.2f}\nCart Items Count: {len(cart.items)}"
+                
+                # Include detailed customer and order information
+                customer_info = {
+                    "name": cart.customer_info.get("name"),
+                    "phone": cart.customer_info.get("phone_number"),
+                }
+                
+                fulfillment_info = {
+                    "type": cart.fulfillment_type,
+                    "branch": cart.branch_name,
+                    "payment_method": cart.payment_method,
+                }
+                
+                # Include pickup/delivery specific details
+                if cart.fulfillment_type == 'pickup':
+                    fulfillment_info["pickup_time"] = cart.pickup_info.get("pickup_time")
+                elif cart.fulfillment_type == 'delivery':
+                    fulfillment_info["delivery_address"] = cart.delivery_info.get("address")
+                    fulfillment_info["delivery_time"] = cart.delivery_info.get("delivery_time")
+                
+                # Include order state
+                order_state = {
+                    "awaiting_fulfillment": cart.awaiting_fulfillment,
+                    "awaiting_details": cart.awaiting_details,
+                    "awaiting_confirmation": cart.awaiting_confirmation,
+                }
+                
+                cart_info_text += f"\nCUSTOMER_INFO: {customer_info}"
+                cart_info_text += f"\nFULFILLMENT_INFO: {fulfillment_info}"
+                cart_info_text += f"\nORDER_STATE: {order_state}"
+                
+                known_details = {
+                    "name": cart.customer_info.get("name"),
+                    "phone": cart.customer_info.get("phone_number"),
+                    "fulfillment": cart.fulfillment_type,
+                    "branch": cart.branch_name,
+                    "payment": cart.payment_method,
+                }
+                missing = order_agent._get_missing_details(cart) if hasattr(order_agent, '_get_missing_details') else []
+                known_details_text = "\nKNOWN_DETAILS: " + str(known_details)
+                missing_details_text = "\nMISSING_DETAILS: " + ", ".join(missing)
+        except Exception:
+            pass
+
+        conv_with_facts = conversation_history + "\n\nFACTS:\n" + "\n".join(facts_blocks) + cart_info_text + known_details_text + missing_details_text
+
+        # Debug: Show what cart information is being included
+        print(f"DEBUG: Cart info being included in LLM context:")
+        print(f"  Cart info text: {cart_info_text}")
+        print(f"  Known details: {known_details_text}")
+        print(f"  Missing details: {missing_details_text}")
+
         prompt = self.builder.build_prompt(
             query=query,
             context_docs=merged_context_docs,
-            conversation_history=conversation_history + "\n\nFACTS:\n" + "\n".join(facts_blocks),
+            conversation_history=conv_with_facts,
             intents=intents,
         )
 
@@ -242,39 +315,9 @@ class Controller:
                 print("No active cart")
         
         # Database status
-        db = SessionLocal()
-        try:
-            print(f"\n[DATABASE STATUS]")
-            
-            # Products
-            products = db.query(Product).all()
-            print(f"\nProducts ({len(products)} total):")
-            for p in products:
-                print(f"  - {p.name}: {p.quantity_in_stock} in stock @ ${p.price}")
-            
-            # Orders
-            orders = db.query(Order).all()
-            print(f"\nOrders ({len(orders)} total):")
-            if not orders:
-                print("  No orders found")
-            else:
-                for o in orders:
-                    customer = db.query(Customer).filter(Customer.id == o.customer_id).first()
-                    customer_name = customer.name if customer else f"Customer #{o.customer_id}"
-                    print(f"  - Order #{o.id}: {customer_name}, Status: {o.status.value}, Type: {o.pickup_or_delivery.value}, Total: ${o.total_amount or 0:.2f}")
-            
-            # Order Items
-            order_items = db.query(OrderItem).all()
-            print(f"\nOrder Items ({len(order_items)} total):")
-            if not order_items:
-                print("  No order items found")
-            else:
-                for oi in order_items:
-                    print(f"  - Order #{oi.order_id}: {oi.quantity}x {oi.product.name} @ ${oi.price_at_time_of_order}")
-                    
-        except Exception as e:
-            print(f"Error accessing database: {e}")
-        finally:
-            db.close()
+        # Note: Database status is already printed by _finalize_order method after committing changes
+        # This avoids showing stale data from a separate session
+        print(f"\n[DATABASE STATUS]")
+        print("(Database status shown by _finalize_order method after order completion)")
         
         print("="*60 + "\n")

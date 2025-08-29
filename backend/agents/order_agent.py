@@ -230,6 +230,47 @@ class OrderAgent(BaseAgent):
         # Check for strong confirmation
         return any(phrase in ql for phrase in strong_confirmations)
 
+    # --- New: robust fulfillment detection (handles typos/variants) ---
+    @staticmethod
+    def _detect_fulfillment(text: str):
+        """Return 'pickup', 'delivery', or None based on robust keyword/typo detection.
+
+        This avoids relying on the LLM wording and catches common misspellings:
+        - pickup variants: 'pickup', 'pick up', 'pick-up', 'pic up', 'picup', 'pik up', 'pick it up'
+        - delivery variants: 'deliver', 'delivery', 'deliver it', 'send', 'send to', 'ship to'
+        """
+        ql = (text or "").lower().strip()
+        # normalize repeated spaces and simple punctuation
+        ql_norm = re.sub(r"[^a-z0-9\s]", " ", ql)
+        ql_norm = re.sub(r"\s+", " ", ql_norm)
+
+        pickup_patterns = [
+            r"\bpick\s*up\b",
+            r"\bpick\-up\b",
+            r"\bpickup\b",
+            r"\bpic\s*up\b",
+            r"\bpicup\b",
+            r"\bpik\s*up\b",
+            r"\bpick\s*it\s*up\b",
+            r"\bcome\s*(get|pick)\s*(it)?\b",
+        ]
+        delivery_patterns = [
+            r"\bdeliver(y)?\b",
+            r"\bdeliver\s*it\b",
+            r"\bsend\b",
+            r"\bsend\s*to\b",
+            r"\bship\s*to\b",
+            r"\baddress\b",
+        ]
+
+        for pat in pickup_patterns:
+            if re.search(pat, ql_norm):
+                return 'pickup'
+        for pat in delivery_patterns:
+            if re.search(pat, ql_norm):
+                return 'delivery'
+        return None
+
     def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str) -> Dict[str, Any]:
         """Single gateway for order finalization - called from one place only."""
         print("DEBUG: Entering _finalize_order method.")
@@ -237,7 +278,16 @@ class OrderAgent(BaseAgent):
 
         if not cart.items:
             print("DEBUG: Cart is empty. Cannot finalize order.")
-            return {"order_placed": False, "note": "Your cart is empty. Please add some items before confirming."}
+            return self._ok(
+                "order",
+                "I notice your cart is empty! Please add some items to your order first. You can say something like 'Add 2 chocolate cakes' or 'I'd like 1 bread and 3 cookies'.",
+                {
+                    "order_placed": False, 
+                    "cart_empty": True,
+                    "needs_items": True,
+                    "note": "Your cart is empty. Please add some items before confirming."
+                }
+            )
 
         # Final stock check
         for item in cart.items:
@@ -274,6 +324,19 @@ class OrderAgent(BaseAgent):
         # Create order items and update inventory
         for item in cart.items:
             product = item['product']
+            print(f"DEBUG: Before decrement - {product.name}: {product.quantity_in_stock} in stock")
+            
+            # Get the product from the current session to ensure SQLAlchemy tracks changes
+            print(f"DEBUG: Before query - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: Before query - Product object in session: {product in db}")
+            print(f"DEBUG: Before query - Product ID: {product.id}")
+            
+            # Query the product from the current session instead of merging
+            product = db.query(Product).filter(Product.id == product.id).first()
+            print(f"DEBUG: After query - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: After query - Product object in session: {product in db}")
+            print(f"DEBUG: After query - Product ID: {product.id}")
+            
             order_item = OrderItem(
                 order_id=order.id,
                 product_id=product.id,
@@ -281,8 +344,19 @@ class OrderAgent(BaseAgent):
                 price_at_time_of_order=product.price
             )
             db.add(order_item)
+            
+            # Decrement stock
+            old_stock = product.quantity_in_stock
             product.quantity_in_stock -= item['quantity']
+            print(f"DEBUG: Stock decrement - {product.name}: {old_stock} -> {product.quantity_in_stock}")
+            print(f"DEBUG: After decrement - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: After decrement - Product object in session: {product in db}")
+            
             print(f"DEBUG: Order item created for product {product.name}. Remaining stock: {product.quantity_in_stock}")
+
+        # Mark order as confirmed only at this confirmation step
+        order.status = OrderStatus.confirmed
+        db.flush()
 
         # Build receipt
         receipt_cart = OrderAgent.ShoppingCart()
@@ -303,23 +377,95 @@ class OrderAgent(BaseAgent):
         self.last_receipt_by_session[session_id] = receipt_text
         print(f"DEBUG: Receipt stored for session {session_id}.")
 
+        # Store product references before clearing cart
+        products_to_refresh = [item['product'] for item in cart.items]
+
+        print("DEBUG: About to start commit process...")
+        
         # Commit all changes to the database
-        db.commit()
+        print(f"DEBUG: About to commit changes. Stock before commit:")
+        for product in products_to_refresh:
+            print(f"  - {product.name}: {product.quantity_in_stock}")
+        
+        try:
+            print("DEBUG: Attempting commit...")
+            db.commit()
+            print("DEBUG: Commit completed successfully")
+        except Exception as commit_error:
+            print(f"DEBUG: Commit failed with error: {commit_error}")
+            print(f"DEBUG: Error type: {type(commit_error).__name__}")
+            import traceback
+            traceback.print_exc()
+            db.rollback()
+            return self._ok(
+                "order",
+                "Sorry, there was an error processing your order. Please try again.",
+                {
+                    "order_placed": False,
+                    "error": "commit_failed",
+                    "note": f"Database commit failed: {str(commit_error)}"
+                }
+            )
+        
+        print("DEBUG: Commit verification starting...")
+        
+        # Verify the commit worked by checking the database directly
+        print(f"DEBUG: Verifying commit by querying database directly:")
+        try:
+            for product in products_to_refresh:
+                fresh_product = db.query(Product).filter(Product.id == product.id).first()
+                print(f"  - {fresh_product.name}: {fresh_product.quantity_in_stock} (from DB)")
+        except Exception as verify_error:
+            print(f"DEBUG: Verification failed: {verify_error}")
+        
+        # Force a flush to ensure changes are written to disk
+        try:
+            print("DEBUG: Attempting flush...")
+            db.flush()
+            print("DEBUG: Flush completed successfully")
+        except Exception as flush_error:
+            print(f"DEBUG: Flush failed: {flush_error}")
+        
+        print("DEBUG: Commit process completed successfully")
 
         # Clear cart
         cart.clear()
         print("DEBUG: Cart cleared after order finalization.")
 
-        # Console DB snapshot
-        self._print_db_status(db)
+        # Console DB snapshot - refresh objects to show updated values
+        db.refresh(order)  # Refresh the order object to get updated status
+        for product in products_to_refresh:
+            db.refresh(product)  # Refresh product objects to get updated stock
+        
+        # Print updated status using refreshed objects
+        print("\n--- Database Status (After Order Confirmation) ---")
+        print("\n[Products - Updated Stock]")
+        for product in products_to_refresh:
+            print(f"- {product.name}: {product.quantity_in_stock} in stock")
+        
+        print(f"\n[Order #{order.id} - Confirmed]")
+        print(f"- Customer ID: {order.customer_id}")
+        print(f"- Status: {order.status.value}")
+        print(f"- Fulfillment: {order.pickup_or_delivery.value}")
+        print(f"- Total: ${order.total_amount}")
+        
+        print("\n[Order Items - Just Created]")
+        order_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+        for oi in order_items:
+            print(f"- {oi.quantity}x {oi.product.name} @ ${oi.price_at_time_of_order}")
+        print("-----------------------")
 
         print("DEBUG: Order finalized successfully.")
-        return {
-            "order_placed": True,
-            "order_id": order.id,
-            "receipt_text": receipt_text,
-            "note": "Your order has been placed successfully!"
-        }
+        return self._ok(
+            "order_confirmed",
+            f"Order #{order.id} confirmed successfully!",
+            {
+                "order_placed": True,
+                "order_id": order.id,
+                "receipt_text": receipt_text,
+                "note": f"Order #{order.id} confirmed successfully!"
+            }
+        )
 
     # --- New: business hour validation ---
     @staticmethod
@@ -485,6 +631,8 @@ class OrderAgent(BaseAgent):
         # Create order items and update inventory
         for item in cart.items:
             product = item['product']
+            print(f"DEBUG: Before decrement - {product.name}: {product.quantity_in_stock} in stock")
+            
             order_item = OrderItem(
                 order_id=order.id,
                 product_id=product.id,
@@ -492,7 +640,14 @@ class OrderAgent(BaseAgent):
                 price_at_time_of_order=product.price
             )
             db.add(order_item)
+            
+            # Decrement stock
+            old_stock = product.quantity_in_stock
             product.quantity_in_stock -= item['quantity']
+            print(f"DEBUG: Stock decrement - {product.name}: {old_stock} -> {product.quantity_in_stock}")
+            print(f"DEBUG: Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: Product object in session: {product in db}")
+            
             print(f"DEBUG: Order item created for product {product.name}. Remaining stock: {product.quantity_in_stock}")
 
         # Build receipt
@@ -525,12 +680,16 @@ class OrderAgent(BaseAgent):
         self._print_db_status(db)
 
         print("DEBUG: Order finalized successfully.")
-        return {
-            "order_placed": True,
-            "order_id": order.id,
-            "receipt_text": receipt_text,
-            "note": "Your order has been placed successfully!"
-        }
+        return self._ok(
+            "order_confirmed",
+            f"Order #{order.id} confirmed successfully!",
+            {
+                "order_placed": True,
+                "order_id": order.id,
+                "receipt_text": receipt_text,
+                "note": f"Order #{order.id} confirmed successfully!"
+            }
+        )
 
     def _print_db_status(self, db: Session):
         """Prints the current status of relevant database tables."""
@@ -642,6 +801,17 @@ class OrderAgent(BaseAgent):
             if addr_match_early:
                 cart.delivery_info["address"] = addr_match_early.group(1).strip()
             
+            # Early fulfillment detection (robust, handles typos)
+            detected_fulfillment = self._detect_fulfillment(query)
+            if detected_fulfillment and not cart.fulfillment_type:
+                cart.fulfillment_type = detected_fulfillment
+                cart.awaiting_fulfillment = False
+                # Move state forward toward details collection
+                missing_details_early = self._get_missing_details(cart)
+                if missing_details_early:
+                    cart.awaiting_details = True
+                print(f"DEBUG: Early fulfillment detected and set to: {cart.fulfillment_type}")
+
             # Check if this is a confirmation
             if 'clear cart' in query.lower() or 'remove everything' in query.lower():
                 cart.clear()
@@ -659,18 +829,54 @@ class OrderAgent(BaseAgent):
                 print("==============================\n")
                 return self._ok("clear_cart", "Your cart has been cleared.", {"cart_cleared": True})
                 
-            # Handle checkout flow
+            # Handle checkout flow - but first check if there are items to add
             if any(k in query.lower() for k in ['checkout', 'place order', 'final order', 'finalize order']):
+                # Check if there are items in the query that should be added first
+                ql_full = query.lower()
+                db_products = db.query(Product).all()
+                items_in_query = []
+                
+                for p in db_products:
+                    pname = p.name.lower()
+                    if pname in ql_full:
+                        qty = 1
+                        qty_match = re.search(r"(\d{1,3})\s+[a-z\s]*" + re.escape(pname), ql_full)
+                        if qty_match:
+                            try:
+                                qty = int(qty_match.group(1))
+                            except Exception:
+                                qty = 1
+                        items_in_query.append((p, qty))
+                
+                # If there are items in the query, add them first
+                if items_in_query:
+                    print(f"DEBUG: Found items in checkout query: {items_in_query}")
+                    for product, qty in items_in_query:
+                        cart.add_item(product, qty)
+                    print(f"DEBUG: Added items to cart. Cart now has {len(cart.items)} items")
+                
+                # Now proceed with checkout flow
                 if not cart.items:
                     return self._ok("checkout", "Your cart is empty. Please add some items before checking out.", {"needs_items": True})
                 
                 # If we don't have fulfillment type, ask for it
                 if not cart.fulfillment_type:
                     cart.awaiting_fulfillment = True
+                    # Include information about what was just added
+                    added_items_info = ""
+                    if items_in_query:
+                        added_summary = ", ".join([f"{qty}x {p.name}" for p, qty in items_in_query])
+                        added_items_info = f" I've added {added_summary} to your cart."
+                    
                     return self._ok(
                         "checkout_fulfillment",
-                        "Would you like delivery or pickup?",
-                        {"needs_fulfillment_type": True, "cart_summary": cart.get_summary()}
+                        f"Would you like delivery or pickup?{added_items_info}",
+                        {
+                            "needs_fulfillment_type": True, 
+                            "cart_summary": cart.get_summary(),
+                            "items_just_added": items_in_query,
+                            "cart_items": len(cart.items)
+                        }
                     )
                 
                 # If delivery, check for address
@@ -723,10 +929,11 @@ class OrderAgent(BaseAgent):
                     {"cart_summary": cart.get_summary(), "cart_items": len(cart.items)}
                 )
             if cart.awaiting_fulfillment:
-                if re.search(r"\bpick\s*up\b|\bpick it up\b|\bpick\b", ql):
+                # Expanded patterns to catch common misspellings
+                if re.search(r"\bpick\s*up\b|\bpick\-up\b|\bpickup\b|\bpic\s*up\b|\bpicup\b|\bpik\s*up\b|\bpick\s*it\s*up\b", ql):
                     cart.fulfillment_type = 'pickup'
                     cart.awaiting_fulfillment = False
-                elif re.search(r"\bdeliver(y)?\b|\bsend\b|\baddress\b", ql):
+                elif re.search(r"\bdeliver(y)?\b|\bdeliver\s*it\b|\bsend\b|\bsend\s*to\b|\baddress\b", ql):
                     cart.fulfillment_type = 'delivery'
                     cart.awaiting_fulfillment = False
                 if cart.awaiting_fulfillment:
@@ -759,6 +966,14 @@ class OrderAgent(BaseAgent):
                         "preview_receipt_text": preview_text,
                         "in_order_context": True,
                     }
+                )
+
+            # If user attempts to confirm when there is no pending confirmation, respond gracefully
+            if self._is_strong_confirmation(query) and not cart.awaiting_confirmation:
+                return self._ok(
+                    "confirm_order",
+                    "I don't see an order awaiting confirmation. Would you like me to start a new order or review your cart?",
+                    {"in_order_context": bool(cart.items), "cart_items": len(cart.items)}
                 )
 
             # Receipt requests (common spellings)
@@ -819,7 +1034,15 @@ class OrderAgent(BaseAgent):
             # If no product in current message, check previous messages for context
             if not product_name:
                 for msg in reversed(session):
-                    msg_content = msg.get('message', '').lower()
+                    try:
+                        raw = msg.get('message') if isinstance(msg, dict) else ''
+                        if raw is None:
+                            continue
+                        if not isinstance(raw, str):
+                            raw = str(raw)
+                        msg_content = raw.lower()
+                    except Exception:
+                        msg_content = ''
                     if 'cheesecake' in msg_content or 'cheese cake' in msg_content:
                         product_name = 'cheesecake'
                         break
@@ -833,8 +1056,10 @@ class OrderAgent(BaseAgent):
             print(f"DEBUG: Product name: {product_name}")
             
             # Determine if it's pickup or delivery
-            is_pickup = any(term in query.lower() for term in ["pickup", "pick up", "come get", "come pick up"]) or ent.get("fulfillment") == "pickup"
-            is_delivery = any(term in query.lower() for term in ["deliver", "delivery", "send to"]) or ent.get("fulfillment") == "delivery"
+            # Prefer robust detector; fall back to simple heuristics and extracted entity
+            ful_det = self._detect_fulfillment(query)
+            is_pickup = (ful_det == 'pickup') or any(term in query.lower() for term in ["pickup", "pick up", "pick-up", "pic up", "come get", "come pick up"]) or ent.get("fulfillment") == "pickup"
+            is_delivery = (ful_det == 'delivery') or any(term in query.lower() for term in ["deliver", "delivery", "deliver it", "send to"]) or ent.get("fulfillment") == "delivery"
             print(f"DEBUG: Is pickup: {is_pickup}")
             
             # Set fulfillment type (do not default silently)
@@ -842,9 +1067,11 @@ class OrderAgent(BaseAgent):
                 if is_pickup:
                     cart.fulfillment_type = 'pickup'
                     fulfillment = FulfillmentType.pickup
+                    print("DEBUG: Fulfillment decided as pickup (detector/heuristics)")
                 elif is_delivery:
                     cart.fulfillment_type = 'delivery'
                     fulfillment = FulfillmentType.delivery
+                    print("DEBUG: Fulfillment decided as delivery (detector/heuristics)")
                 else:
                     fulfillment = None
                 print(f"DEBUG: Fulfillment type set to: {fulfillment}")
@@ -1002,6 +1229,12 @@ class OrderAgent(BaseAgent):
     def _get_missing_details(self, cart) -> List[str]:
         """Helper method to get list of missing required details."""
         missing_details = []
+        
+        # First check if there are items in the cart
+        if not cart.items:
+            missing_details.append('items')
+            return missing_details  # If no items, don't check other details
+            
         if not cart.customer_info.get('name'):
             missing_details.append('name')
         if not cart.branch_name:
@@ -1020,7 +1253,18 @@ class OrderAgent(BaseAgent):
 
     def _ask_for_missing_details(self, cart, missing_details: List[str]) -> AgentResult:
         """Helper method to ask for missing details."""
-        if 'name' in missing_details:
+        if 'items' in missing_details:
+            return self._ok(
+                "checkout_missing_details", 
+                "I notice your cart is empty! Please add some items to your order first. You can say something like 'Add 2 chocolate cakes' or 'I'd like 1 bread and 3 cookies'.",
+                {
+                    "missing_details": missing_details, 
+                    "asking_for": "items", 
+                    "cart_empty": True,
+                    "in_order_context": True
+                }
+            )
+        elif 'name' in missing_details:
             return self._ok("checkout_missing_details", "Got it! What's the name for the order?", {"missing_details": missing_details, "asking_for": "name", "in_order_context": True})
         elif 'branch' in missing_details:
             try:
