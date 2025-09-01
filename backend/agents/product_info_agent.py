@@ -12,8 +12,15 @@ class ProductInfoAgent(BaseAgent):
     def __init__(self):
         pass
 
-    def handle(self, session_id: str, query: str, session: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def handle(self, session_id: str, query: str, session: List[Dict[str, Any]] = None, memory_context: Dict[str, Any] = None) -> Dict[str, Any]:
         print(f"[WORKFLOW] Executing ProductInfoAgent...")
+        
+        # NEW: Use memory context for enhanced understanding
+        if memory_context:
+            print(f"[MEMORY] Using memory context: {len(memory_context.get('important_features', []))} features")
+            if memory_context.get('summary'):
+                print(f"[MEMORY] Summary: {memory_context['summary']}")
+        
         db = SessionLocal()
         try:
             q = query or ""
@@ -27,6 +34,12 @@ class ProductInfoAgent(BaseAgent):
                     if isinstance(msg, dict) and msg.get("role") == "nlu" and isinstance(msg.get("message"), dict):
                         entities = msg.get("message", {})
                         break
+            
+            # NEW: Use LLM to enhance entity extraction with memory context
+            if memory_context:
+                enhanced_entities = self._enhance_entities_with_llm(query, entities, memory_context)
+                entities.update(enhanced_entities)
+                print(f"[LLM] Enhanced entities: {enhanced_entities}")
             
             price_min = entities.get("price_min")
             price_max = entities.get("price_max")
@@ -80,3 +93,50 @@ class ProductInfoAgent(BaseAgent):
             return self._clarify(intent="product_info", question="Which item or category are you interested in? e.g. 'chocolate cake' or 'pastries under $4'")
         finally:
             db.close()
+    
+    def _enhance_entities_with_llm(self, query: str, entities: Dict[str, Any], memory_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Use LLM to enhance entity extraction with memory context."""
+        try:
+            from ..app.dual_api_system import DualAPISystem
+            
+            prompt = f"""
+            You are analyzing a user query about bakery products to extract enhanced entity information.
+            
+            User Query: "{query}"
+            
+            Current Entities: {entities}
+            
+            Memory Context: {memory_context if memory_context else "None"}
+            
+            Extract additional product-related information in JSON format:
+            {{
+                "product_name": "specific product mentioned",
+                "category": "product category (cakes, breads, pastries, etc.)",
+                "price_min": "minimum price if mentioned",
+                "price_max": "maximum price if mentioned",
+                "preferences": ["user preferences from memory context"],
+                "quantity": "quantity if mentioned",
+                "special_requirements": "dietary restrictions or special needs"
+            }}
+            
+            Guidelines:
+            - Use memory context to understand user preferences
+            - Extract implicit information (e.g., "something sweet" = desserts)
+            - Consider previous interactions and preferences
+            - Return valid JSON only
+            """
+            
+            dual_api = DualAPISystem()
+            response = dual_api.generate_response_with_primary_api(prompt)
+            
+            # Parse response
+            import re
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            else:
+                return {}
+                
+        except Exception as e:
+            print(f"LLM entity enhancement failed: {e}")
+            return {}

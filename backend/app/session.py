@@ -19,6 +19,15 @@ class SessionManager:
         self.use_redis = True
         self.memory_sessions = {}  # Fallback in-memory storage
         
+        # Enhanced memory tracking
+        self.memory_features = {}  # Track important features per session
+        self.memory_weights = {
+            "cart_state": 100,      # Highest priority
+            "last_10_messages": 80, # High priority
+            "important_features": 60, # Medium priority
+            "summary": 40           # Lower priority
+        }
+        
         try:
             self.redis_client = redis.Redis(
                 host=Config.REDIS_HOST,
@@ -259,6 +268,238 @@ class SessionManager:
                 del self.memory_sessions[session_id]
                 return True
             return False
+    
+    def extract_memory_context(self, session_id: str, current_query: str) -> Dict[str, Any]:
+        """
+        Extract comprehensive memory context using LLM for smart understanding.
+        
+        Args:
+            session_id: Unique session identifier
+            current_query: User's current query
+            
+        Returns:
+            Structured memory context with extracted information
+        """
+        try:
+            # Get conversation context
+            conversation = self.get_conversation_context(session_id)
+            
+            # Get cart state from order agent (if available)
+            cart_state = self._get_cart_state(session_id)
+            
+            # Use LLM to extract context (Enhanced API approach)
+            context = self._extract_context_with_llm(conversation, cart_state, current_query)
+            
+            # Cache the extracted context
+            self._cache_memory_context(session_id, context)
+            
+            return context
+            
+        except Exception as e:
+            print(f"Memory context extraction failed: {e}")
+            # Fallback to basic context
+            return self._fallback_context_extraction(session_id, current_query)
+    
+    def _extract_context_with_llm(self, conversation: List[Dict], cart_state: Dict, current_query: str) -> Dict[str, Any]:
+        """Extract context using Enhanced API for smart understanding."""
+        from .dual_api_system import DualAPISystem
+        
+        try:
+            # Use Enhanced API to understand complex user query
+            dual_api = DualAPISystem()
+            
+            # Extract meaning, features, and cart info from complex query
+            context = dual_api.extract_context_with_enhanced_api(conversation, cart_state, current_query)
+            
+            # Calculate memory weights
+            weights = dual_api.calculate_memory_weights(context)
+            print(f"[MEMORY] Calculated weights: {weights}")
+            
+            # IMPORTANT: This context will be used by your existing prompt_builder.py
+            # We're NOT replacing your system, just enhancing it with memory context
+            return context
+            
+        except Exception as e:
+            print(f"Enhanced API context extraction failed: {e}")
+            return self._fallback_context_extraction_simple(conversation, cart_state, current_query)
+    
+    def _build_context_extraction_prompt(self, conversation: List[Dict], cart_state: Dict, current_query: str) -> str:
+        """Build prompt for context extraction."""
+        return f"""
+        Analyze this conversation and extract structured information for a bakery chatbot memory system.
+        
+        Conversation History:
+        {self._format_conversation_for_prompt(conversation)}
+        
+        Current Cart State:
+        {cart_state}
+        
+        Current Query:
+        {current_query}
+        
+        Extract the following information in JSON format:
+        {{
+            "summary": "Brief summary of conversation (key points, user preferences, habits)",
+            "last_10_messages": ["message1", "message2", ...],
+            "cart_state": {{
+                "items": ["item1", "item2"],
+                "total": "total_amount",
+                "status": "cart_status",
+                "customer_info": "customer_details",
+                "fulfillment_info": "pickup_delivery_details"
+            }},
+            "important_features": [
+                "feature1 (e.g., prefers chocolate desserts)",
+                "feature2 (e.g., orders pickup frequently)",
+                "feature3 (e.g., likes breakfast items)"
+            ],
+            "rule_base": [
+                "rule1 (e.g., business_hours_validation)",
+                "rule2 (e.g., stock_validation)",
+                "rule3 (e.g., order_confirmation)"
+            ]
+        }}
+        
+        Guidelines:
+        - Summary should capture user preferences, habits, and key conversation points
+        - Important features should focus on user behavior patterns and preferences
+        - Rule base should identify business logic and validation rules needed
+        - Cart state should reflect current order status and details
+        - Be concise but comprehensive in feature extraction
+        """
+    
+    def _format_conversation_for_prompt(self, conversation: List[Dict]) -> str:
+        """Format conversation for the prompt."""
+        formatted = []
+        for msg in conversation[-10:]:  # Last 10 messages
+            role = msg.get('role', 'unknown')
+            message = msg.get('message', '')
+            formatted.append(f"{role}: {message}")
+        return "\n".join(formatted)
+    
+    def _parse_context_response(self, llm_response: str) -> Dict[str, Any]:
+        """Parse LLM response to extract context."""
+        import json
+        import re
+        
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'\{.*\}', llm_response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        
+        # Fallback parsing
+        return {
+            "summary": "Context extraction completed",
+            "last_10_messages": [],
+            "cart_state": {},
+            "important_features": [],
+            "rule_base": []
+        }
+    
+    def _get_cart_state(self, session_id: str) -> Dict[str, Any]:
+        """Get cart state from order agent if available."""
+        try:
+            from ..agents.order_agent import OrderAgent
+            order_agent = OrderAgent()
+            cart = order_agent.carts.get(session_id) if hasattr(order_agent, 'carts') else None
+            
+            if cart:
+                return {
+                    "items": [f"{item['quantity']}x {item['product'].name}" for item in cart.items] if cart.items else [],
+                    "total": cart.get_total(),
+                    "status": "active" if cart.items else "empty",
+                    "customer_info": cart.customer_info,
+                    "fulfillment_info": {
+                        "type": cart.fulfillment_type,
+                        "branch": cart.branch_name,
+                        "payment_method": cart.payment_method
+                    }
+                }
+        except:
+            pass
+        
+        return {"items": [], "total": 0, "status": "no_cart"}
+    
+    def _fallback_context_extraction(self, session_id: str, current_query: str) -> Dict[str, Any]:
+        """Fallback context extraction when LLM fails."""
+        conversation = self.get_conversation_context(session_id)
+        cart_state = self._get_cart_state(session_id)
+        return self._fallback_context_extraction_simple(conversation, cart_state, current_query)
+    
+    def _fallback_context_extraction_simple(self, conversation: List[Dict], cart_state: Dict, current_query: str) -> Dict[str, Any]:
+        """Fallback context extraction when Enhanced API fails."""
+        # Even in fallback, try to use LLM for basic understanding
+        try:
+            from .generate import GenerationClient
+            llm_client = GenerationClient()
+            
+            # Simple prompt for fallback
+            fallback_prompt = f"""
+            Analyze this conversation briefly and extract basic context:
+            Conversation: {conversation[-5:]}  # Last 5 messages
+            Query: {current_query}
+            
+            Provide a simple JSON with: summary, important_features, rule_base
+            """
+            
+            response = llm_client.generate_answer(fallback_prompt)
+            
+            # Try to parse JSON response
+            import re
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                return {
+                    "summary": parsed.get("summary", "Fallback context"),
+                    "last_10_messages": [msg.get("message", "") for msg in conversation[-10:]],
+                    "cart_state": cart_state,
+                    "important_features": parsed.get("important_features", []),
+                    "rule_base": parsed.get("rule_base", ["business_hours_validation"])
+                }
+        except:
+            pass
+        
+        # Ultimate fallback - minimal context
+        return {
+            "summary": "Minimal fallback context",
+            "last_10_messages": [msg.get("message", "") for msg in conversation[-10:]],
+            "cart_state": cart_state,
+            "important_features": [],
+            "rule_base": ["business_hours_validation"]
+        }
+    
+    def _cache_memory_context(self, session_id: str, context: Dict[str, Any]):
+        """Cache memory context for performance."""
+        if session_id not in self.memory_features:
+            self.memory_features[session_id] = {}
+        
+        self.memory_features[session_id] = context
+    
+    def get_memory_context(self, session_id: str) -> Dict[str, Any]:
+        """Get cached memory context if available."""
+        return self.memory_features.get(session_id, {})
+    
+    def calculate_memory_weights(self, context: Dict[str, Any]) -> Dict[str, float]:
+        """Calculate memory weights based on importance."""
+        weights = {}
+        
+        for key, base_weight in self.memory_weights.items():
+            if key in context:
+                # Adjust weight based on content richness
+                content = context[key]
+                if isinstance(content, list):
+                    richness_factor = min(len(content) / 5, 1.0)  # Normalize to 0-1
+                elif isinstance(content, dict):
+                    richness_factor = min(len(content) / 3, 1.0)
+                else:
+                    richness_factor = 0.5
+                
+                weights[key] = base_weight * richness_factor
+        
+        return weights
 
 def main():
     """Main function for testing the session manager."""

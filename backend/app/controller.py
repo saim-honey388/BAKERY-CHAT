@@ -2,6 +2,7 @@
 
 This is an initial implementation that uses rule-based NLU and agents stubs.
 """
+import json
 from typing import Dict, Any, List
 from ..nlu.rules import rule_based_intents
 from ..nlu.llm_router import llm_route
@@ -42,13 +43,21 @@ class Controller:
         # save user message
         self.session_manager.add_message(session_id, "user", query)
 
+        # NEW: Extract memory context using Enhanced API for complex query understanding
+        print("[WORKFLOW] 1a. Extracting memory context from complex query...")
+        memory_context = self.session_manager.extract_memory_context(session_id, query)
+        print(f"[WORKFLOW] 1b. Memory context extracted: {len(memory_context.get('important_features', []))} features")
+        print(f"[WORKFLOW] 1c. Cart info extracted: {memory_context.get('cart_state', {})}")
+
         # routing: rules first
         print("[WORKFLOW] 2. Detecting intent...")
         intents = rule_based_intents(query)
+        print(f"[WORKFLOW] 2a. Rule-based intents detected: {intents}")
         if not intents:
-            print("[WORKFLOW] 2a. No rule-based intent found, trying LLM router...")
+            print("[WORKFLOW] 2b. No rule-based intent found, trying LLM router...")
             routed = llm_route(query)
             intents = routed.get("intents", ["general_info"]) if isinstance(routed, dict) else ["general_info"]
+            print(f"[WORKFLOW] 2c. LLM router intents: {intents}")
         # Bias routing to order agent if an order flow is in progress OR if user is making ordering requests
         try:
             order_agent: OrderAgent = AGENT_MAP.get("order")  # type: ignore
@@ -61,14 +70,14 @@ class Controller:
                            cart_state.get("has_cart"))
             
             # Check if this looks like an ordering query
-            ordering_keywords = ["want", "order", "get", "take", "add", "cart", "pickup", "delivery", "please", "2", "two"]
+            ordering_keywords = ["want", "order", "get", "take", "add", "cart", "pickup", "delivery", "2", "two"]
             looks_like_order = any(keyword in query.lower() for keyword in ordering_keywords)
             
             # Route to order agent if in order flow OR if it looks like an ordering request
             if in_order_flow or looks_like_order:
                 if "order" not in intents:
                     intents = ["order"] + [i for i in intents if i != "order"]
-                    print(f"[WORKFLOW] 2c. Biased routing to order agent. In order flow: {in_order_flow}, Looks like order: {looks_like_order}")
+                    print(f"[WORKFLOW] 2d. Biased routing to order agent. In order flow: {in_order_flow}, Looks like order: {looks_like_order}")
         except Exception:
             pass
         print(f"[WORKFLOW] 2b. Intent(s) detected: {intents}")
@@ -78,19 +87,27 @@ class Controller:
         extracted = self.entity_extractor.extract(query) if self.entity_extractor else {}
         print(f"[WORKFLOW] 3a. Entities extracted: {extracted}")
 
+        # NEW: Distribute memory context to agents based on intent
+        print("[WORKFLOW] 3b. Distributing memory context to agents...")
+        agent_memory = self._distribute_memory_to_agents(memory_context, intents)
+
         # call agents
         print("[WORKFLOW] 4. Dispatching to agent(s)...")
         results: List[AgentResult] = []
         for intent in intents:
             agent = AGENT_MAP.get(intent)
             if not agent:
+                print(f"[ERROR] Agent '{intent}' not found in AGENT_MAP: {list(AGENT_MAP.keys())}")
                 continue
             # obtain conversation context and append an 'nlu' message containing extracted entities
             session_ctx = list(self.session_manager.get_conversation_context(session_id))
             # append a non-persistent local marker so agents can read entities from the last message
             session_with_entities = session_ctx + [{"role": "nlu", "message": extracted}]
-            print(f"[WORKFLOW] 4a. Calling agent: '{agent.name}' for intent '{intent}'")
-            res = agent.handle(session_id, query, session=session_with_entities)
+            
+            # NEW: Pass memory context to agent
+            agent_memory_context = agent_memory.get(intent, {})
+            print(f"[WORKFLOW] 4a. Calling agent: '{agent.name}' for intent '{intent}' with memory context")
+            res = agent.handle(session_id, query, session=session_with_entities, memory_context=agent_memory_context)
             results.append(res)
             print(f"[WORKFLOW] 4b. Agent '{agent.name}' returned facts: {res.facts}")
 
@@ -154,6 +171,22 @@ class Controller:
         for r in results:
             facts_blocks.append(f"[{r.agent}] {r.facts}")
             merged_context_docs.extend(getattr(r, "context_docs", []))
+        
+        # NEW: Use your existing prompt_builder.py with enhanced memory context
+        print("[WORKFLOW] 5. Building prompt with existing prompt_builder.py + memory context...")
+        from .prompt_builder import PromptBuilder
+        prompt_builder = PromptBuilder()
+        
+        # Build prompt using your existing system + memory context
+        prompt = prompt_builder.build_prompt(
+            query=query,
+            context_docs=merged_context_docs,
+            conversation_history=self._format_conversation_for_prompt(session_id),
+            intents=intents
+        )
+        
+        # ENHANCE the prompt with memory context (don't replace, enhance!)
+        enhanced_prompt = self._enhance_prompt_with_memory(prompt, memory_context, facts_blocks)
 
         conversation_history = "\n".join([f"{m['role']}: {m['message']}" for m in self.session_manager.get_conversation_context(session_id)])
 
@@ -239,7 +272,12 @@ class Controller:
         )
 
         print("[WORKFLOW] 6. Generating final response with LLM...")
-        final_text = self.builder.llm_generate(prompt)
+        try:
+            final_text = self.builder.llm_generate(prompt)
+            print(f"[WORKFLOW] 6a. LLM generation successful: {type(final_text)}")
+        except Exception as e:
+            print(f"[ERROR] LLM generation failed: {e}")
+            final_text = "Sorry, I'm having trouble generating a response right now."
 
         # save assistant response
         # Ensure we save the final text, not the whole object, to history
@@ -248,7 +286,12 @@ class Controller:
             response_text = final_text['response']
         elif not isinstance(final_text, str):
             response_text = str(final_text) # Fallback
-        self.session_manager.add_message(session_id, "assistant", response_text)
+        
+        try:
+            self.session_manager.add_message(session_id, "assistant", response_text)
+            print(f"[WORKFLOW] 6b. Message saved to session successfully")
+        except Exception as e:
+            print(f"[ERROR] Failed to save message to session: {e}")
 
         # collect citations
         citations = []
@@ -258,16 +301,123 @@ class Controller:
 
         print(f"[WORKFLOW] 7. Final response generated.")
         
-        # Print order details and database status after every response
-        self._print_order_status_and_db(session_id, results)
+        try:
+            # Print order details and database status after every response
+            self._print_order_status_and_db(session_id, results)
+        except Exception as e:
+            print(f"[ERROR] Failed to print order status: {e}")
         
         print("="*50 + "\n")
-        return {"response": final_text, "citations": citations, "intents": intents}
+        
+        try:
+            return {"response": final_text, "citations": citations, "intents": intents}
+        except Exception as e:
+            print(f"[ERROR] Failed to return response: {e}")
+            return {"response": "An error occurred while processing your request.", "citations": [], "intents": intents}
+    
+    def _distribute_memory_to_agents(self, memory_context: Dict[str, Any], intents: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Distribute memory context to agents based on intent and importance.
+        
+        Args:
+            memory_context: Full memory context from session manager
+            intents: List of detected intents
+            
+        Returns:
+            Dictionary mapping intent to agent-specific memory context
+        """
+        distribution = {}
+        
+        for intent in intents:
+            if intent == "general_info":
+                # General Info Agent: Summary + Last 10 messages + Rule base
+                distribution[intent] = {
+                    "summary": memory_context.get("summary"),
+                    "last_10_messages": memory_context.get("last_10_messages"),
+                    "rule_base": memory_context.get("rule_base")
+                }
+            elif intent == "product_info":
+                # Product Info Agent: Summary + Last 10 messages + Important features + Database + Rule base + Cart info
+                distribution[intent] = {
+                    "summary": memory_context.get("summary"),
+                    "last_10_messages": memory_context.get("last_10_messages"),
+                    "important_features": memory_context.get("important_features"),
+                    "database_info": memory_context.get("database_info"),
+                    "rule_base": memory_context.get("rule_base"),
+                    "cart_info": memory_context.get("cart_state")
+                }
+            elif intent == "order":
+                # Order Agent: Cart state (1st priority) + Important features + Database (2nd priority) + Summary + Last 10 messages + Rule base
+                distribution[intent] = {
+                    "cart_state": memory_context.get("cart_state"),  # 1st priority
+                    "important_features": memory_context.get("important_features"),
+                    "database_info": memory_context.get("database_info"),  # 2nd priority
+                    "summary": memory_context.get("summary"),
+                    "last_10_messages": memory_context.get("last_10_messages"),
+                    "rule_base": memory_context.get("rule_base")
+                }
+        
+        return distribution
+    
+    def _enhance_prompt_with_memory(self, base_prompt: str, memory_context: Dict[str, Any], facts_blocks: List[str]) -> str:
+        """
+        Enhance the existing prompt with memory context without replacing your prompt_builder.py rules.
+        
+        Args:
+            base_prompt: The prompt built by your existing prompt_builder.py
+            memory_context: Memory context from Enhanced API
+            facts_blocks: Agent facts
+            
+        Returns:
+            Enhanced prompt with memory context
+        """
+        # Add memory context section to your existing prompt
+        memory_section = f"""
+        
+        ========================================
+        ENHANCED MEMORY CONTEXT (LLM-Derived)
+        ========================================
+        
+        MEMORY SUMMARY: {memory_context.get('summary', 'No summary available')}
+        
+        IMPORTANT FEATURES (LLM-Extracted):
+        {chr(10).join([f"- {feature}" for feature in memory_context.get('important_features', [])])}
+        
+        CART STATE FROM MEMORY:
+        {json.dumps(memory_context.get('cart_state', {}), indent=2)}
+        
+        RULE BASE (LLM-Identified):
+        {chr(10).join([f"- {rule}" for rule in memory_context.get('rule_base', [])])}
+        
+        ========================================
+        END MEMORY CONTEXT
+        ========================================
+        
+        """
+        
+        # Insert memory context after your existing prompt rules
+        enhanced_prompt = base_prompt + memory_section
+        
+        return enhanced_prompt
+    
+    def _format_conversation_for_prompt(self, session_id: str) -> str:
+        """Format conversation history for prompt building."""
+        conversation = self.session_manager.get_conversation_context(session_id)
+        formatted = []
+        for msg in conversation[-10:]:  # Last 10 messages
+            role = msg.get('role', 'unknown')
+            message = msg.get('message', '')
+            formatted.append(f"{role}: {message}")
+        return "\n".join(formatted)
     
     def _print_order_status_and_db(self, session_id: str, results: List[AgentResult]):
         """Print order details and database status for debugging."""
-        from ..data.database import SessionLocal
-        from ..data.models import Product, Order, OrderItem, Customer
+        try:
+            from ..data.database import SessionLocal
+            from ..data.models import Product, Order, OrderItem, Customer
+        except ImportError as e:
+            print(f"[ERROR] Failed to import database modules: {e}")
+            return
         
         print("\n" + "="*60)
         print("ORDER STATUS & DATABASE SNAPSHOT")

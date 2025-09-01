@@ -14,7 +14,8 @@ class Config:
     
     # Groq API Configuration
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    GROQ_LLM_MODEL = "llama3-8b-8192"
+    ENHANCED_GROQ_API_KEY = os.getenv("ENHANCED_GROQ_API_KEY")
+    GROQ_LLM_MODEL = "llama-3.1-8b-instant"
     
     # Redis Configuration
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")

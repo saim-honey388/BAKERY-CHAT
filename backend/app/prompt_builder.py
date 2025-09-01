@@ -252,6 +252,7 @@ Assistant:"""
             gen = GenerationClient()
             return gen.generate_answer(prompt)
         except Exception as e:
+            print(f"[ERROR] LLM generation failed: {e}")
             # fallback: return a simple concatenation of facts if LLM unavailable
             return "Sorry, I'm having trouble contacting the language model right now."
 

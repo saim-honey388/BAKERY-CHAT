@@ -52,6 +52,10 @@ class GenerationClient:
         
         try:
             print(f"DEBUG: Sending request to Groq API", flush=True)
+            print(f"DEBUG: Model: {self.llm_model}", flush=True)
+            print(f"DEBUG: API Key: {self.api_key[:10]}...", flush=True)
+            print(f"DEBUG: Payload: {payload}", flush=True)
+            
             response = requests.post(
                 self.api_base_url,
                 headers=headers,
@@ -60,7 +64,11 @@ class GenerationClient:
             )
             
             print(f"DEBUG: Received response from Groq API, status: {response.status_code}", flush=True)
-            response.raise_for_status()
+            
+            if response.status_code != 200:
+                print(f"DEBUG: Error response body: {response.text}", flush=True)
+                response.raise_for_status()
+                
             data = response.json()
             print(f"DEBUG: Parsed response JSON", flush=True)
             
@@ -72,6 +80,9 @@ class GenerationClient:
             
         except requests.exceptions.RequestException as e:
             print(f"DEBUG: Error generating answer: {str(e)}", flush=True)
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"DEBUG: Response status: {e.response.status_code}", flush=True)
+                print(f"DEBUG: Response body: {e.response.text}", flush=True)
             raise Exception(f"Error generating answer: {str(e)}")
         except (KeyError, IndexError) as e:
             print(f"DEBUG: Error parsing generation response: {str(e)}", flush=True)
