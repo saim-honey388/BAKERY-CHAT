@@ -17,17 +17,21 @@ class Config:
     ENHANCED_GROQ_API_KEY = os.getenv("ENHANCED_GROQ_API_KEY")
     GROQ_LLM_MODEL = "llama-3.1-8b-instant"
 
-    # Enhanced Provider Switch (groq|gemini)
-    ENHANCED_PROVIDER = os.getenv("ENHANCED_PROVIDER", "groq").lower()
+    # Provider Switches (groq|gemini)
+    ENHANCED_PROVIDER = os.getenv("ENHANCED_PROVIDER", "gemini").lower()
+    PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "gemini").lower()
 
     # Gemini (Google) API Configuration for Enhanced client
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    # Default to Gemini 2.0 Flash with fallback to Flash-Lite
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash-lite")
 
     @classmethod
     def debug_print(cls):
         print(f"[CONFIG] ENHANCED_PROVIDER={cls.ENHANCED_PROVIDER}")
-        print(f"[CONFIG] GEMINI_MODEL={cls.GEMINI_MODEL} set={bool(cls.GEMINI_API_KEY)}")
+        print(f"[CONFIG] PRIMARY_PROVIDER={cls.PRIMARY_PROVIDER}")
+        print(f"[CONFIG] GEMINI_MODEL={cls.GEMINI_MODEL} fallback={cls.GEMINI_FALLBACK_MODEL} set={bool(cls.GEMINI_API_KEY)}")
         print(f"[CONFIG] GROQ_MODEL={cls.GROQ_LLM_MODEL} set={bool(cls.GROQ_API_KEY)}")
     
     # Redis Configuration

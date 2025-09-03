@@ -151,27 +151,17 @@ class EnhancedAPIClient:
                 text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                 return text
             except Exception as e:
-                print(f"Enhanced API (Gemini) call failed: {e}. Attempting Groq fallback...")
-                # Fallback to Groq if available
-                groq_key = Config.ENHANCED_GROQ_API_KEY or Config.GROQ_API_KEY
-                if groq_key:
-                    try:
-                        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
-                        payload = {
-                            "model": "llama-3.1-8b-instant",
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.1,
-                            "max_tokens": 1000,
-                            "stop": ["\nUser:", "\n\n"]
-                        }
-                        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
-                        resp.raise_for_status()
-                        data = resp.json()
-                        return data["choices"][0]["message"]["content"]
-                    except Exception as e2:
-                        print(f"Enhanced API Groq fallback failed: {e2}")
-                        raise e
-                else:
+                print(f"Enhanced API (Gemini) call failed: {e}. Attempting Gemini fallback model...")
+                # Fallback to Gemini Flash-Lite
+                try:
+                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{Config.GEMINI_FALLBACK_MODEL}:generateContent"
+                    resp = requests.post(fallback_url, params=params, headers=headers, json=payload, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    return text
+                except Exception as e2:
+                    print(f"Enhanced API Gemini fallback failed: {e2}")
                     raise e
         else:
             # Groq-compatible
@@ -235,10 +225,19 @@ class PrimaryAPIClient:
     
     def __init__(self, api_key: str = None):
         """Initialize Primary API client."""
-        self.api_key = api_key or Config.GROQ_API_KEY
-        # Use configured Groq model to avoid 400 model_not_found
-        self.model = Config.GROQ_LLM_MODEL
-        self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
+        provider = Config.PRIMARY_PROVIDER
+        self.provider = provider
+        if provider == "gemini":
+            self.api_key = api_key or Config.GEMINI_API_KEY
+            if not self.api_key:
+                raise ValueError("Primary API (Gemini) key is required")
+            self.model = Config.GEMINI_MODEL
+            self.fallback_model = Config.GEMINI_FALLBACK_MODEL
+            self.api_base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        else:
+            self.api_key = api_key or Config.GROQ_API_KEY
+            self.model = Config.GROQ_LLM_MODEL
+            self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
         
         if not self.api_key:
             raise ValueError("Primary API key is required")
@@ -254,58 +253,90 @@ class PrimaryAPIClient:
     
     def _call_primary_api(self, prompt: str) -> str:
         """Call Primary API for response generation."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
+        if self.provider == "gemini":
+            params = {"key": self.api_key}
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 800
                 }
-            ],
-            "temperature": 0.7,  # Higher temperature for creative responses
-            "max_tokens": 500,
-            "stop": ["\nUser:", "\n\n"]
-        }
-        
-        # Simple retry with backoff for rate limits and transient errors
-        max_retries = 3
-        backoff = 2.0
-        last_err = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                print(f"DEBUG: Calling Primary API for response generation (attempt {attempt})...")
-                response = requests.post(
-                    self.api_base_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                )
-                if response.status_code == 429:
-                    # Rate limited: observe Retry-After if present
-                    retry_after = float(response.headers.get('Retry-After', backoff))
-                    print(f"DEBUG: Rate limited. Sleeping for {retry_after}s before retry...")
-                    time.sleep(retry_after)
-                    continue
-                response.raise_for_status()
-                data = response.json()
-                print(f"DEBUG: Primary API response received successfully")
-                return data["choices"][0]["message"]["content"]
-            except Exception as e:
-                last_err = e
-                print(f"Primary API call failed on attempt {attempt}: {e}")
-                if attempt < max_retries:
-                    sleep_s = backoff * attempt
-                    print(f"DEBUG: Backing off for {sleep_s}s before retry...")
-                    time.sleep(sleep_s)
-                else:
-                    print("DEBUG: Exhausted retries for Primary API")
-        # After retries exhausted
-        raise last_err if last_err else RuntimeError("Primary API call failed without exception")
+            }
+            max_retries = 3
+            backoff = 2.0
+            last_err = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"DEBUG: Calling Primary API for response generation (attempt {attempt})...")
+                    resp = requests.post(self.api_base_url, params=params, headers=headers, json=payload, timeout=30)
+                    if resp.status_code == 429:
+                        retry_after = backoff * attempt
+                        print(f"DEBUG: Rate limited. Sleeping for {retry_after}s before retry...")
+                        time.sleep(retry_after)
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    print("DEBUG: Primary API response received successfully")
+                    return text
+                except Exception as e:
+                    last_err = e
+                    print(f"Primary API (Gemini) call failed on attempt {attempt}: {e}")
+                    if attempt == max_retries:
+                        # Last attempt: try fallback model once
+                        try:
+                            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.fallback_model}:generateContent"
+                            resp = requests.post(fallback_url, params=params, headers=headers, json=payload, timeout=30)
+                            resp.raise_for_status()
+                            data = resp.json()
+                            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            print("DEBUG: Primary API fallback (Gemini Flash-Lite) response received successfully")
+                            return text
+                        except Exception as e2:
+                            print(f"Primary API Gemini fallback failed: {e2}")
+            # After retries exhausted
+            raise last_err if last_err else RuntimeError("Primary API call failed without exception")
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 500,
+                "stop": ["\nUser:", "\n\n"]
+            }
+            max_retries = 3
+            backoff = 2.0
+            last_err = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"DEBUG: Calling Primary API for response generation (attempt {attempt})...")
+                    response = requests.post(self.api_base_url, headers=headers, json=payload, timeout=30)
+                    if response.status_code == 429:
+                        retry_after = float(response.headers.get('Retry-After', backoff))
+                        print(f"DEBUG: Rate limited. Sleeping for {retry_after}s before retry...")
+                        time.sleep(retry_after)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    print(f"DEBUG: Primary API response received successfully")
+                    return data["choices"][0]["message"]["content"]
+                except Exception as e:
+                    last_err = e
+                    print(f"Primary API call failed on attempt {attempt}: {e}")
+                    if attempt < max_retries:
+                        sleep_s = backoff * attempt
+                        print(f"DEBUG: Backing off for {sleep_s}s before retry...")
+                        time.sleep(sleep_s)
+                    else:
+                        print("DEBUG: Exhausted retries for Primary API")
+            raise last_err if last_err else RuntimeError("Primary API call failed without exception")
     
     def _fallback_response(self, prompt: str) -> str:
         """Fallback response when Primary API fails."""
@@ -318,8 +349,9 @@ class DualAPISystem:
         """Initialize dual-API system."""
         # Get API keys from environment variables
         from .config import Config
-        self.enhanced_client = EnhancedAPIClient(enhanced_api_key or Config.ENHANCED_GROQ_API_KEY)
-        self.primary_client = PrimaryAPIClient(primary_api_key or Config.GROQ_API_KEY)
+        # Both default to Gemini when configured
+        self.enhanced_client = EnhancedAPIClient(enhanced_api_key or Config.GEMINI_API_KEY)
+        self.primary_client = PrimaryAPIClient(primary_api_key or Config.GEMINI_API_KEY)
         
         # Memory weight hierarchy as per plan
         self.memory_weights = {
