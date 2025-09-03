@@ -43,7 +43,7 @@ class Config:
     CHUNK_SIZE = 250
     CHUNK_OVERLAP = 50
     MAX_CONTEXT_DOCS = 5
-    MAX_CONVERSATION_TURNS = 10
+    MAX_CONVERSATION_TURNS = 14
     
     # FAISS Configuration
     FAISS_INDEX_PATH = "data/processed/faiss_index.bin"

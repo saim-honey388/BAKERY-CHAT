@@ -1533,6 +1533,10 @@ class OrderAgent(BaseAgent):
                     # Branch
                     if nlu.get("branch"):
                         cart.branch_name = nlu.get("branch")
+                        print(f"[NLU FALLBACK] Set branch_name from 'branch': {cart.branch_name}")
+                    elif nlu.get("location"):  # Also check for location as branch
+                        cart.branch_name = nlu.get("location")
+                        print(f"[NLU FALLBACK] Set branch_name from 'location': {cart.branch_name}")
             except Exception as e:
                 print(f"[NLU FALLBACK] Failed to apply entity-based add-to-cart: {e}")
 
@@ -1593,6 +1597,7 @@ class OrderAgent(BaseAgent):
                             cart.pickup_info['pickup_time'] = info['pickup_time']
                         if 'branch' in info:
                             cart.branch_name = info['branch']
+                            print(f"[CART UPDATE] Set branch_name: {cart.branch_name}")
                     elif update["type"] == "set_fulfillment":
                         # Support LLM using set_fulfillment to set time/branch; normalize
                         info = update.get("info") or {}
@@ -1639,6 +1644,20 @@ class OrderAgent(BaseAgent):
                         cart,
                         memory_context,
                         db,
+                    )
+                # If we are awaiting confirmation and nothing is missing, always show preview receipt now
+                if cart.awaiting_confirmation and not self._get_missing_details(cart):
+                    print("[CONFIRMATION] Details complete and awaiting confirmation - showing preview receipt")
+                    preview_receipt = self._build_preview_receipt(cart)
+                    cart.last_prompt = "preview_receipt"
+                    return self._ok(
+                        "order",
+                        "Here is your order summary. Please review and confirm:",
+                        {
+                            "in_order_context": True,
+                            "preview_receipt_text": preview_receipt,
+                            "awaiting_confirmation": True
+                        }
                     )
             else:
                 print("[CART STATE] No cart state updates from LLM")
@@ -1757,14 +1776,23 @@ class OrderAgent(BaseAgent):
                         memory_context,
                         db,
                     )
-
-                if cart.awaiting_confirmation:
-                    print("[CONFIRMATION] Order awaiting confirmation - finalizing...")
+                # Require strong user confirmation to finalize
+                if cart.awaiting_confirmation and self._is_strong_confirmation(query):
+                    print("[CONFIRMATION] Strong confirmation detected - finalizing order")
                     cart.last_prompt = "confirm_order"
                     return self._finalize_order(db, cart, session_id, memory_context)
-                else:
-                    print("[CONFIRMATION] No order awaiting confirmation")
-                    return self._llm_clarify_next_step("Ask for order confirmation or offer to review cart.", cart, memory_context, db)
+                # Otherwise, show preview receipt again and ask to confirm
+                print("[CONFIRMATION] Not a strong confirmation - showing preview receipt and asking to confirm")
+                preview_receipt = self._build_preview_receipt(cart)
+                return self._ok(
+                    "order",
+                    "Here is your order summary again. Please say 'confirm' to place the order:",
+                    {
+                        "in_order_context": True,
+                        "preview_receipt_text": preview_receipt,
+                        "awaiting_confirmation": True
+                    }
+                )
             
             elif order_flow_decision.get("action") == "show_receipt":
                 print("[LLM DECISION] Action: show_receipt - Displaying order receipt...")

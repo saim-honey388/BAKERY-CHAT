@@ -413,7 +413,7 @@ class Controller:
         """Format conversation history for prompt building."""
         conversation = self.session_manager.get_conversation_context(session_id)
         formatted = []
-        for msg in conversation[-10:]:  # Last 10 messages
+        for msg in conversation[-Config.MAX_CONVERSATION_TURNS:]:  # Last N messages per config
             role = msg.get('role', 'unknown')
             message = msg.get('message', '')
             formatted.append(f"{role}: {message}")

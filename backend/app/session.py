@@ -340,7 +340,7 @@ class SessionManager:
         Extract the following information in JSON format:
         {{
             "summary": "Brief summary of conversation (key points, user preferences, habits)",
-            "last_10_messages": ["message1", "message2", ...],
+            "last_10_messages": ["message1", "message2", ...],  # will include last N per Config.MAX_CONVERSATION_TURNS
             "cart_state": {{
                 "items": ["item1", "item2"],
                 "total": "total_amount",
@@ -371,7 +371,7 @@ class SessionManager:
     def _format_conversation_for_prompt(self, conversation: List[Dict]) -> str:
         """Format conversation for the prompt."""
         formatted = []
-        for msg in conversation[-10:]:  # Last 10 messages
+        for msg in conversation[-Config.MAX_CONVERSATION_TURNS:]:  # Last N messages per config
             role = msg.get('role', 'unknown')
             message = msg.get('message', '')
             formatted.append(f"{role}: {message}")
