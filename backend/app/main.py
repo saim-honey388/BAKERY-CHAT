@@ -21,7 +21,7 @@ from .rerank import Reranker
 from .prompt_builder import PromptBuilder
 from .generate import GenerationClient
 from .postprocess import Postprocessor
-from .controller import Controller
+from .controller import Controller, AGENT_MAP
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -69,6 +69,7 @@ class SessionCreateResponse(BaseModel):
     """Response model for session creation."""
     session_id: str
     created: bool
+    cart_state: Dict[str, Any]
 
 @app.get("/")
 async def root():
@@ -91,8 +92,14 @@ async def create_session(request: SessionCreateRequest):
     
     # Create session
     created = session_manager.create_session(session_id)
+    # Include initial cart state from OrderAgent
+    try:
+        order_agent = AGENT_MAP.get("order")
+        cart_state = order_agent.get_cart_state(session_id) if order_agent else {"has_cart": False}
+    except Exception:
+        cart_state = {"has_cart": False}
     
-    return SessionCreateResponse(session_id=session_id, created=created)
+    return SessionCreateResponse(session_id=session_id, created=created, cart_state=cart_state)
 
 @app.post("/query", response_model=QueryResponse)
 async def query_chatbot(request: QueryRequest):

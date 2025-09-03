@@ -94,6 +94,15 @@ class Controller:
         # call agents
         print("[WORKFLOW] 4. Dispatching to agent(s)...")
         results: List[AgentResult] = []
+        # If we're in an active order flow, only dispatch the order agent for this turn
+        if 'order' in intents and any([
+            cart_state.get('awaiting_fulfillment'),
+            cart_state.get('awaiting_details'),
+            cart_state.get('awaiting_confirmation'),
+            cart_state.get('has_cart')
+        ]):
+            intents = ['order']
+
         for intent in intents:
             agent = AGENT_MAP.get(intent)
             if not agent:

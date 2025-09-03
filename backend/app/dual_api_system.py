@@ -11,15 +11,38 @@ import json
 import requests
 from typing import Dict, List, Any, Optional
 from .config import Config
+import time
 
 class EnhancedAPIClient:
     """Enhanced API Client for context extraction and memory analysis."""
     
     def __init__(self, api_key: str = None):
-        """Initialize Enhanced API client."""
-        self.api_key = api_key or Config.GROQ_API_KEY
-        self.model = "llama-3.1-8b-instant"  # Enhanced model for better understanding
-        self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
+        """Initialize Enhanced API client.
+
+        Supports providers:
+        - groq (default): uses OpenAI-compatible chat completions
+        - gemini: uses Google Generative Language API (Gemini)
+        """
+        provider = Config.ENHANCED_PROVIDER
+        self.provider = provider
+        if provider == "gemini":
+            # Prefer Gemini if configured, else fall back to Groq transparently
+            self.api_key = api_key or Config.GEMINI_API_KEY
+            if not self.api_key:
+                print("Enhanced API init: Gemini API key missing. Falling back to Groq Enhanced API.")
+                self.provider = "groq"
+                self.api_key = Config.ENHANCED_GROQ_API_KEY or Config.GROQ_API_KEY
+                self.model = "llama-3.1-8b-instant"
+                self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
+            else:
+                self.model = Config.GEMINI_MODEL
+                self.api_base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            print(f"[ENHANCED_PROVIDER] {self.provider} model={self.model}")
+        else:
+            self.api_key = api_key or Config.ENHANCED_GROQ_API_KEY or Config.GROQ_API_KEY
+            self.model = "llama-3.1-8b-instant"
+            self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
+            print(f"[ENHANCED_PROVIDER] groq model={self.model}")
         
         if not self.api_key:
             raise ValueError("Enhanced API key is required")
@@ -105,40 +128,73 @@ class EnhancedAPIClient:
         return "\n".join(formatted)
     
     def _call_enhanced_api(self, prompt: str) -> str:
-        """Call Enhanced API for context extraction."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
+        """Call Enhanced API for context extraction for the active provider."""
+        if self.provider == "gemini":
+            # Gemini generateContent API
+            params = {"key": self.api_key}
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 1000
                 }
-            ],
-            "temperature": 0.1,  # Low temperature for consistent extraction
-            "max_tokens": 1000,
-            "stop": ["\nUser:", "\n\n"]
-        }
-        
-        try:
-            print(f"DEBUG: Calling Enhanced API for context extraction...")
-            response = requests.post(
-                self.api_base_url,
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            print(f"DEBUG: Enhanced API response received successfully")
-            return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"Enhanced API call failed: {e}")
-            raise e
+            }
+            try:
+                print("DEBUG: Calling Gemini API for context extraction...")
+                resp = requests.post(self.api_base_url, params=params, headers=headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                # Extract text from candidates
+                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                return text
+            except Exception as e:
+                print(f"Enhanced API (Gemini) call failed: {e}. Attempting Groq fallback...")
+                # Fallback to Groq if available
+                groq_key = Config.ENHANCED_GROQ_API_KEY or Config.GROQ_API_KEY
+                if groq_key:
+                    try:
+                        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+                        payload = {
+                            "model": "llama-3.1-8b-instant",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "max_tokens": 1000,
+                            "stop": ["\nUser:", "\n\n"]
+                        }
+                        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        return data["choices"][0]["message"]["content"]
+                    except Exception as e2:
+                        print(f"Enhanced API Groq fallback failed: {e2}")
+                        raise e
+                else:
+                    raise e
+        else:
+            # Groq-compatible
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 1000,
+                "stop": ["\nUser:", "\n\n"]
+            }
+            try:
+                print("DEBUG: Calling Enhanced API for context extraction (Groq)...")
+                response = requests.post(self.api_base_url, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(f"Enhanced API (Groq) call failed: {e}")
+                raise e
     
     def _parse_enhanced_response(self, response: str) -> Dict[str, Any]:
         """Parse Enhanced API response."""
@@ -180,7 +236,8 @@ class PrimaryAPIClient:
     def __init__(self, api_key: str = None):
         """Initialize Primary API client."""
         self.api_key = api_key or Config.GROQ_API_KEY
-        self.model = "llama3-8b-8192"  # Current Groq model for cost efficiency
+        # Use configured Groq model to avoid 400 model_not_found
+        self.model = Config.GROQ_LLM_MODEL
         self.api_base_url = "https://api.groq.com/openai/v1/chat/completions"
         
         if not self.api_key:
@@ -215,21 +272,40 @@ class PrimaryAPIClient:
             "stop": ["\nUser:", "\n\n"]
         }
         
-        try:
-            print(f"DEBUG: Calling Primary API for response generation...")
-            response = requests.post(
-                self.api_base_url,
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            print(f"DEBUG: Primary API response received successfully")
-            return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"Primary API call failed: {e}")
-            raise e
+        # Simple retry with backoff for rate limits and transient errors
+        max_retries = 3
+        backoff = 2.0
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"DEBUG: Calling Primary API for response generation (attempt {attempt})...")
+                response = requests.post(
+                    self.api_base_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                if response.status_code == 429:
+                    # Rate limited: observe Retry-After if present
+                    retry_after = float(response.headers.get('Retry-After', backoff))
+                    print(f"DEBUG: Rate limited. Sleeping for {retry_after}s before retry...")
+                    time.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                print(f"DEBUG: Primary API response received successfully")
+                return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                last_err = e
+                print(f"Primary API call failed on attempt {attempt}: {e}")
+                if attempt < max_retries:
+                    sleep_s = backoff * attempt
+                    print(f"DEBUG: Backing off for {sleep_s}s before retry...")
+                    time.sleep(sleep_s)
+                else:
+                    print("DEBUG: Exhausted retries for Primary API")
+        # After retries exhausted
+        raise last_err if last_err else RuntimeError("Primary API call failed without exception")
     
     def _fallback_response(self, prompt: str) -> str:
         """Fallback response when Primary API fails."""

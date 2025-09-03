@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 import re
 import datetime
+import json
 
 class OrderAgent(BaseAgent):
     name = "order"
@@ -31,6 +32,7 @@ class OrderAgent(BaseAgent):
             self.last_prompt = None  # Track the last prompt type for confirmation logic
             self.last_suggested_items = []  # Track suggested items for "that one" references
             self.branch_name = None  # Selected branch for pickup/delivery
+            self.expected_field = None  # When awaiting_details, which specific field is expected next
             
         def add_item(self, product, quantity):
             """Add an item to the cart or update quantity if it already exists."""
@@ -57,6 +59,7 @@ class OrderAgent(BaseAgent):
             self.awaiting_confirmation = False
             self.last_prompt = None
             self.last_suggested_items = []
+            self.expected_field = None
             
         def get_total(self):
             """Calculate the total price of items in the cart."""
@@ -370,7 +373,227 @@ class OrderAgent(BaseAgent):
             # Fallback to basic entity extractor
             return self.entity_extractor.extract(query) if self.entity_extractor else {}
     
-    def _handle_order_with_llm(self, query: str, cart: ShoppingCart, memory_context: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    def _build_llm_context(self, session: List[Dict[str, str]], cart: "OrderAgent.ShoppingCart", memory_context: Dict[str, Any], db: Session) -> Dict[str, Any]:
+        """Build a single authoritative context object for LLM decisions."""
+        try:
+            from ..app.prompt_builder import PromptBuilder
+        except Exception:
+            PromptBuilder = None  # Optional; fail-soft
+
+        # Last 10 messages (user/assistant) with clear role distinction and sequence
+        last_10_messages = []
+        try:
+            for i, m in enumerate((session or [])[-10:], 1):
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                    role = m.get("role")
+                    message = m.get("message", "")
+                    
+                    # Add context markers to prevent confusion
+                    if role == "user":
+                        # User messages - these are actual requests/intents
+                        last_10_messages.append({
+                            "sequence": i,
+                            "role": "USER_REQUEST", 
+                            "message": message,
+                            "type": "user_intent",
+                            "note": "This is what the USER asked for - treat as actual request"
+                        })
+                    elif role == "assistant":
+                        # Bot responses - these are suggestions/clarifications, NOT user requests
+                        last_10_messages.append({
+                            "sequence": i,
+                            "role": "BOT_RESPONSE", 
+                            "message": message,
+                            "type": "bot_suggestion",
+                            "note": "This is what the BOT suggested/asked - do NOT treat as user request"
+                        })
+        except Exception:
+            last_10_messages = []
+
+        # Cart snapshot
+        cart_snapshot = {
+            "items": [
+                {"name": it['product'].name, "quantity": it['quantity'], "price": float(it['product'].price)}
+                for it in (cart.items or [])
+            ],
+            "customer_info": dict(cart.customer_info or {}),
+            "fulfillment_type": cart.fulfillment_type,
+            "payment_method": cart.payment_method,
+            "branch": cart.branch_name,
+            "awaiting": {
+                "fulfillment": bool(cart.awaiting_fulfillment),
+                "details": bool(cart.awaiting_details),
+                "confirmation": bool(cart.awaiting_confirmation),
+            },
+        }
+
+        # Known/missing details
+        try:
+            missing = self._get_missing_details(cart)
+        except Exception:
+            missing = []
+        known = {
+            "name": cart.customer_info.get("name") if isinstance(cart.customer_info, dict) else None,
+            "phone": cart.customer_info.get("phone_number") if isinstance(cart.customer_info, dict) else None,
+            "fulfillment": cart.fulfillment_type,
+            "branch": cart.branch_name,
+            "payment": cart.payment_method,
+        }
+
+        # Prompt rules (common + order)
+        rules = {}
+        if PromptBuilder is not None:
+            try:
+                pb = PromptBuilder()
+                rules["common"] = pb.common_prompt
+                rules["order"] = pb.agent_prompts.get("order")
+            except Exception:
+                rules = {}
+
+        # DB catalog summary (names only) to prevent hallucination
+        try:
+            products = db.query(Product).all()
+            catalog = [p.name for p in products]
+        except Exception:
+            catalog = []
+
+        unified = {
+            "summary": memory_context.get("summary") if isinstance(memory_context, dict) else None,
+            "last_10_messages": last_10_messages,
+            "cart": cart_snapshot,
+            "known_details": known,
+            "missing_details": missing,
+            "rules": rules,
+            "db_catalog": catalog,
+            "weights": {
+                "cart_state": 1.0,
+                "last_10_messages": 0.8,
+                "important_features": 0.6,
+                "summary": 0.4,
+            },
+        }
+
+        # Debug: confirm summary presence and show conversation context
+        try:
+            has_summary = bool(unified.get("summary"))
+            print(f"[LLM CTX] Summary present: {has_summary}")
+            print(f"[LLM CTX] Last {len(unified.get('last_10_messages', []))} messages:")
+            for msg in unified.get('last_10_messages', [])[-3:]:  # Show last 3
+                seq = msg.get('sequence', '?')
+                role = msg.get('role', '?')
+                message = msg.get('message', '')[:50]
+                print(f"  {seq}. {role}: {message}...")
+        except Exception:
+            pass
+
+        return unified
+
+    def _build_preview_receipt(self, cart: ShoppingCart) -> str:
+        """Build a preview receipt for user confirmation before placing order."""
+        lines = []
+        lines.append("=" * 50)
+        lines.append("ORDER PREVIEW - Please Review Before Confirmation")
+        lines.append("=" * 50)
+        lines.append("")
+        
+        # Items
+        lines.append("ITEMS:")
+        subtotal = 0.0
+        for item in cart.items:
+            product = item['product']
+            quantity = item['quantity']
+            unit_price = float(product.price)
+            line_total = unit_price * quantity
+            subtotal += line_total
+            lines.append(f"  {quantity}x {product.name} @ ${unit_price:.2f} = ${line_total:.2f}")
+        
+        lines.append("")
+        lines.append(f"Subtotal: ${subtotal:.2f}")
+        tax = subtotal * 0.0825  # 8.25% tax
+        total = subtotal + tax
+        lines.append(f"Tax (8.25%): ${tax:.2f}")
+        lines.append(f"TOTAL: ${total:.2f}")
+        lines.append("")
+        
+        # Customer details
+        lines.append("CUSTOMER DETAILS:")
+        if cart.customer_info.get('name'):
+            lines.append(f"  Name: {cart.customer_info['name']}")
+        if cart.customer_info.get('phone_number'):
+            lines.append(f"  Phone: {cart.customer_info['phone_number']}")
+        
+        # Fulfillment details
+        lines.append("")
+        lines.append("FULFILLMENT:")
+        if cart.fulfillment_type == 'pickup':
+            lines.append(f"  Type: Pickup")
+            if cart.pickup_info.get('pickup_time'):
+                lines.append(f"  Time: {cart.pickup_info['pickup_time']}")
+            if cart.branch_name:
+                lines.append(f"  Branch: {cart.branch_name}")
+        elif cart.fulfillment_type == 'delivery':
+            lines.append(f"  Type: Delivery")
+            if cart.delivery_info.get('address'):
+                lines.append(f"  Address: {cart.delivery_info['address']}")
+            if cart.delivery_info.get('delivery_time'):
+                lines.append(f"  Time: {cart.delivery_info['delivery_time']}")
+        
+        # Payment
+        if cart.payment_method:
+            lines.append(f"  Payment: {cart.payment_method.capitalize()}")
+        
+        lines.append("")
+        lines.append("IMPORTANT:")
+        lines.append("- You can modify any details before confirming")
+        lines.append("- Say 'confirm' to place this order")
+        lines.append("- Say 'cancel' to clear the cart")
+        lines.append("- Say 'modify' to change any details")
+        lines.append("")
+        lines.append("=" * 50)
+        
+        return "\n".join(lines)
+
+    def _create_product_embeddings(self, db: Session) -> Dict[str, List[float]]:
+        """Create embeddings for all products to enable better similarity search."""
+        try:
+            from ..app.embed import EmbeddingClient
+            
+            # Get all products
+            products = db.query(Product).all()
+            embeddings = {}
+            
+            # Initialize embedding client
+            embed_gen = EmbeddingClient()
+            
+            for product in products:
+                # Create rich product description for embedding
+                desc = f"{product.name}"
+                if hasattr(product, 'category') and product.category:
+                    desc += f" {product.category}"
+                if hasattr(product, 'description') and product.description:
+                    desc += f" {product.description}"
+                
+                # Generate embedding
+                try:
+                    embedding = embed_gen.generate_embedding(desc)
+                    if embedding:
+                        embeddings[product.name] = embedding
+                        print(f"[EMBEDDINGS] Created embedding for {product.name}")
+                except Exception as e:
+                    print(f"[EMBEDDINGS] Failed to create embedding for {product.name}: {e}")
+                    continue
+            
+            print(f"[EMBEDDINGS] Successfully created {len(embeddings)} product embeddings")
+            return embeddings
+            
+        except ImportError:
+            print("[EMBEDDINGS] EmbeddingGenerator not available")
+            return {}
+        except Exception as e:
+            print(f"[EMBEDDINGS] Error creating product embeddings: {e}")
+            return {}
+
+    def _handle_order_with_llm(self, query: str, cart: ShoppingCart, memory_context: Dict[str, Any], db: Session, session: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """Use LLM to handle COMPLETE order management - no hardcoded logic."""
         try:
             from ..app.dual_api_system import DualAPISystem
@@ -379,32 +602,25 @@ class OrderAgent(BaseAgent):
             products = db.query(Product).all()
             product_info = {p.name.lower(): {"id": p.id, "price": p.price, "stock": p.quantity_in_stock} for p in products}
             
-            # Create comprehensive prompt for complete order management
+            # Unified authoritative context for LLM
+            unified_context = self._build_llm_context(session=session or [], cart=cart, memory_context=memory_context or {}, db=db)
             prompt = f"""
             You are an AI managing a complete bakery order system.
-            
+
             User Query: "{query}"
-            
-            Current Cart State:
-            - Items: {cart.items}
-            - Customer Info: {cart.customer_info}
-            - Fulfillment Type: {cart.fulfillment_type}
-            - Awaiting: Fulfillment={cart.awaiting_fulfillment}, Details={cart.awaiting_details}, Confirmation={cart.awaiting_confirmation}
-            
-            Memory Context: {memory_context if memory_context else "None"}
-            
-            Available Products: {product_info}
-            
-            Your task is to understand the user's intent and manage the order accordingly.
-            
-            Return JSON with this structure:
+
+            CONTEXT (authoritative): {json.dumps(unified_context)}
+
+            Available Products (DB): {product_info}
+
+            Output STRICT JSON with this structure:
             {{
                 "cart_updates": [
                     {{
-                        "type": "add_item/remove_item/update_customer_info/set_fulfillment",
+                        "type": "add_item/remove_item/update_customer_info/set_fulfillment/modify_item",
                         "product": "product_name",
                         "quantity": 1,
-                        "info": {{"name": "value"}},
+                        "info": {{"field": "value"}},
                         "fulfillment_type": "pickup/delivery"
                     }}
                 ],
@@ -413,16 +629,30 @@ class OrderAgent(BaseAgent):
                     "awaiting_confirmation": true/false,
                     "awaiting_fulfillment": true/false
                 }},
-                "response_type": "ask_details/confirm_order/show_receipt/upsell",
-                "message": "what to say to user"
+                "response_type": "ask_details/confirm_order/show_receipt/upsell/modify_cart",
+                "message": "what to say to user",
+                "inventory_suggestions": ["similar products if requested item not available"]
             }}
+
+            CRITICAL RULES:
+            - Treat SERVER CART as ground truth; never remove items or change quantities unless the USER explicitly asks in THIS turn.
+            - Do NOT suggest "clear_cart" or remove items unless the USER explicitly asks.
+            - Only add items if the USER explicitly asked for them in THIS turn.
+            - Never set fulfillment to anything other than "pickup" or "delivery".
+            - Only set customer fields that the USER provided in THIS turn.
+            - NEVER invent items not in db_catalog. If unclear, ask a short, DB-anchored clarification.
             
-            Guidelines:
-            - Understand implicit requests (e.g., "I want chocolate cake" = add item)
-            - Handle variations and typos (e.g., "pic up" = pickup)
-            - Consider memory context for user preferences
-            - Make decisions based on current cart state
-            - Return valid JSON only
+            CONVERSATION CONTEXT RULES (CRITICAL):
+            - USER_REQUEST messages contain actual user intents - treat these as real requests
+            - BOT_RESPONSE messages are bot suggestions/clarifications - NEVER treat these as user requests
+            - Example: If bot asked "Would you like delivery or pickup?" and user said "delivery", only "delivery" is the user request
+            - Example: If bot suggested "We also have croissants" - this is NOT a user request to add croissants
+            - Only act on USER_REQUEST content, ignore BOT_RESPONSE content for user intent
+            - Sequence numbers show conversation order - higher numbers are more recent
+            - Current user query is the LATEST USER_REQUEST in the sequence
+            
+            - Think step-by-step privately. Then respond with ONLY valid JSON (no comments, no prose).
+            - Return valid JSON only.
             """
             
             # Use Enhanced API for complete order management
@@ -456,10 +686,129 @@ class OrderAgent(BaseAgent):
                 # Add to cart
                 cart.add_item(product, quantity)
                 print(f"DEBUG: Added {quantity}x {product.name} to cart")
+                return {"success": True, "product": product, "message": f"Added {quantity}x {product.name} to cart"}
             else:
-                print(f"DEBUG: Product {product_name} not found or insufficient stock")
+                # Find similar products for suggestions using enhanced embedding-based similarity
+                suggestions = self._find_similar_products_enhanced(product_name, db)
+                if not product:
+                    print(f"DEBUG: Product {product_name} not found")
+                    return {"success": False, "message": f"Sorry, we don't have {product_name}.", "suggestions": suggestions}
+                else:
+                    print(f"DEBUG: Insufficient stock for {product_name}. Available: {product.quantity_in_stock}, Requested: {quantity}")
+                    return {"success": False, "message": f"Sorry, we only have {product.quantity_in_stock} {product.name} in stock.", "suggestions": suggestions}
         except Exception as e:
             print(f"DEBUG: Error adding item to cart: {e}")
+            return {"success": False, "message": f"Error adding item: {str(e)}"}
+    
+    def _find_similar_products_enhanced(self, product_name: str, db: Session) -> List[str]:
+        """Find similar products using embedding-based cosine similarity for better suggestions."""
+        try:
+            # Try to use the existing retrieval system for embeddings
+            try:
+                from ..app.retrieval import HybridRetriever
+                retriever = HybridRetriever()
+                
+                # Get product descriptions and names for similarity search
+                all_products = db.query(Product).filter(Product.quantity_in_stock > 0).all()
+                
+                # Create product descriptions for embedding
+                product_descriptions = []
+                for product in all_products:
+                    # Combine name, category, and description for better context
+                    desc = f"{product.name} {product.category if hasattr(product, 'category') else ''}"
+                    if hasattr(product, 'description') and product.description:
+                        desc += f" {product.description}"
+                    product_descriptions.append({
+                        'product': product,
+                        'description': desc
+                    })
+                
+                # Use the retriever to find similar products
+                similar_products = retriever.hybrid_search(product_name, k=10)
+                
+                # Extract product names from similar results
+                suggestions = []
+                for result in similar_products:
+                    # Try to find the product in our database
+                    for prod_desc in product_descriptions:
+                        if prod_desc['description'].lower() in result.get('text', '').lower():
+                            suggestions.append(prod_desc['product'].name)
+                            break
+                
+                # Fallback to basic text matching if embedding search fails
+                if not suggestions:
+                    print("[SIMILARITY] Embedding search failed, using fallback text matching")
+                    return self._find_similar_products_fallback(product_name, db)
+                
+                # Remove duplicates and limit results
+                unique_suggestions = list(dict.fromkeys(suggestions))[:5]
+                print(f"[SIMILARITY] Found {len(unique_suggestions)} similar products using embeddings")
+                return unique_suggestions
+                
+            except ImportError:
+                print("[SIMILARITY] HybridRetriever not available, using fallback")
+                return self._find_similar_products_fallback(product_name, db)
+            except Exception as e:
+                print(f"[SIMILARITY] Embedding search error: {e}, using fallback")
+                return self._find_similar_products_fallback(product_name, db)
+                
+        except Exception as e:
+            print(f"[SIMILARITY] Enhanced similarity search failed: {e}")
+            return self._find_similar_products_fallback(product_name, db)
+    
+    def _find_similar_products_fallback(self, product_name: str, db: Session) -> List[str]:
+        """Fallback method using basic text matching when embeddings are not available."""
+        try:
+            # Convert product name to searchable terms
+            search_terms = product_name.lower().split()
+            
+            # Get all products
+            all_products = db.query(Product).filter(Product.quantity_in_stock > 0).all()
+            suggestions = []
+            
+            for product in all_products:
+                product_lower = product.name.lower()
+                # Check if any search term matches
+                if any(term in product_lower for term in search_terms):
+                    suggestions.append(product.name)
+                # Check category-based suggestions
+                elif any(term in product_lower for term in ['bread', 'cake', 'pastry', 'cookie']):
+                    suggestions.append(product.name)
+            
+            # Limit suggestions and remove duplicates
+            unique_suggestions = list(set(suggestions))[:5]
+            return unique_suggestions
+            
+        except Exception as e:
+            print(f"[SIMILARITY] Fallback similarity search failed: {e}")
+            return []
+    
+    def _find_similar_products(self, product_name: str, db: Session) -> List[str]:
+        """Find similar products when the requested product is not available."""
+        try:
+            # Convert product name to searchable terms
+            search_terms = product_name.lower().split()
+            
+            # Get all products
+            all_products = db.query(Product).filter(Product.quantity_in_stock > 0).all()
+            suggestions = []
+            
+            for product in all_products:
+                product_lower = product.name.lower()
+                # Check if any search term matches
+                if any(term in product_lower for term in search_terms):
+                    suggestions.append(product.name)
+                # Check category-based suggestions
+                elif any(term in product_lower for term in ['bread', 'cake', 'pastry', 'cookie']):
+                    suggestions.append(product.name)
+            
+            # Limit suggestions and remove duplicates
+            unique_suggestions = list(set(suggestions))[:5]
+            return unique_suggestions
+            
+        except Exception as e:
+            print(f"DEBUG: Error finding similar products: {e}")
+            return []
     
     def _remove_item_from_cart(self, cart: ShoppingCart, product_name: str):
         """Remove item from cart."""
@@ -469,7 +818,7 @@ class OrderAgent(BaseAgent):
         except Exception as e:
             print(f"DEBUG: Error removing item from cart: {e}")
     
-    def _analyze_order_flow_with_llm(self, query: str, cart: ShoppingCart, memory_context: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    def _analyze_order_flow_with_llm(self, query: str, cart: ShoppingCart, memory_context: Dict[str, Any], db: Session, session: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """Use LLM to analyze the order flow and decide what action to take."""
         try:
             from ..app.dual_api_system import DualAPISystem
@@ -478,38 +827,50 @@ class OrderAgent(BaseAgent):
             products = db.query(Product).all()
             product_info = {p.name.lower(): {"id": p.id, "price": p.price, "stock": p.quantity_in_stock} for p in products}
             
+            unified_context = self._build_llm_context(session=session, cart=cart, memory_context=memory_context or {}, db=db)
             prompt = f"""
-            You are analyzing a user query to determine the appropriate order flow action.
-            
+            You are analyzing a user query to determine the appropriate next order action.
+
             User Query: "{query}"
-            
-            Current Cart State:
-            - Items: {cart.items}
-            - Customer Info: {cart.customer_info}
-            - Fulfillment Type: {cart.fulfillment_type}
-            - Awaiting: Fulfillment={cart.awaiting_fulfillment}, Details={cart.awaiting_details}, Confirmation={cart.awaiting_confirmation}
-            
-            Memory Context: {memory_context if memory_context else "None"}
-            
-            Available Products: {product_info}
-            
-            Determine what action the system should take. Return JSON with:
+
+            CONTEXT (authoritative): {json.dumps(unified_context)}
+
+            Available Products (DB): {product_info}
+
+            Return STRICT JSON:
             {{
-                "action": "clear_cart/checkout/show_cart/set_fulfillment/collect_details/confirm_order/show_receipt",
+                "action": "clear_cart/checkout/show_cart/set_fulfillment/collect_details/confirm_order/show_receipt/modify_cart",
                 "fulfillment_type": "pickup/delivery if setting fulfillment",
                 "missing_details": ["list of missing details if collecting details"],
                 "reasoning": "why you chose this action",
                 "items_to_add": [
                     {{"product": "product_name", "quantity": 1}}
-                ]
+                ],
+                "modifications": {{
+                    "type": "change_fulfillment/change_customer_info/change_items/change_payment",
+                    "details": "what to change"
+                }}
             }}
+
+            CRITICAL RULES:
+            - Do NOT clear, remove, or change SERVER CART unless the USER explicitly asked in THIS turn.
+            - Only propose add_item if the USER asked for it in THIS turn; otherwise leave items_to_add empty.
+            - Never set fulfillment to anything other than "pickup" or "delivery".
+            - Only set customer fields that the USER provided in THIS turn.
+            - NEVER invent items not in db_catalog. If unclear, ask a short, DB-anchored clarification.
+            - TIME HANDLING: If the user provides a time and fulfillment is pickup, treat it as pickup_time, NOT a change_fulfillment. Do not modify fulfillment_type from time input.
             
-            Guidelines:
-            - Understand implicit requests (e.g., "I want chocolate cake" = add item)
-            - Handle variations and typos (e.g., "pic up" = pickup)
-            - Consider memory context for user preferences
-            - Make decisions based on current cart state
-            - Return valid JSON only
+            CONVERSATION CONTEXT RULES (CRITICAL):
+            - USER_REQUEST messages contain actual user intents - treat these as real requests
+            - BOT_RESPONSE messages are bot suggestions/clarifications - NEVER treat these as user requests
+            - Example: If bot asked "Would you like delivery or pickup?" and user said "delivery", only "delivery" is the user request
+            - Example: If bot suggested "We also have croissants" - this is NOT a user request to add croissants
+            - Only act on USER_REQUEST content, ignore BOT_RESPONSE content for user intent
+            - Sequence numbers show conversation order - higher numbers are more recent
+            - Current user query is the LATEST USER_REQUEST in the sequence
+            
+            - Think step-by-step privately. Then respond with ONLY valid JSON (no comments, no prose).
+            - Return valid JSON only.
             """
             
             dual_api = DualAPISystem()
@@ -520,12 +881,7 @@ class OrderAgent(BaseAgent):
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
-                
-                # Add items if specified
-                if parsed.get("items_to_add"):
-                    for item in parsed["items_to_add"]:
-                        self._add_item_to_cart(cart, item["product"], item["quantity"], db)
-                
+                # Do not mutate cart here to avoid double-adds; main flow will handle updates explicitly
                 return parsed
             else:
                 return {}
@@ -534,23 +890,63 @@ class OrderAgent(BaseAgent):
             print(f"LLM order flow analysis failed: {e}")
             return {}
 
-    def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str) -> Dict[str, Any]:
+    def _llm_clarify_next_step(self, query: str, cart: ShoppingCart, memory_context: Dict[str, Any], db: Session) -> "AgentResult":
+        """Ask LLM for a single short next-step clarification. No item additions here."""
+        try:
+            from ..app.dual_api_system import DualAPISystem
+            cart_items_text = ", ".join([f"{it['quantity']}x {it['product'].name}" for it in cart.items]) or "(empty)"
+            # Determine the first missing field if available
+            try:
+                missing = self._get_missing_details(cart)
+            except Exception:
+                missing = []
+            expected_field = cart.expected_field or (missing[0] if missing else None)
+            allowed_fields = [
+                'items','name','phone_number','pickup_time','address','delivery_time','payment_method','branch','fulfillment'
+            ]
+            prompt = f"""
+            You are assisting a bakery order flow.
+            Tone & Style:
+            - Warm, natural, and concise (use our bakery assistant voice from system rules).
+            - At most two short sentences: an optional friendly acknowledgement, then one clear question.
+            - Second person ("you"), never third person.
+            - If the user asked for an item, you may briefly acknowledge it in a tasty, human way (one short clause), then ask the question.
+            - Do NOT add items or assume details.
+            Clarification Rules:
+            - Ask ONLY for the FIRST missing required field, if any.
+            - Allowed fields: {allowed_fields}.
+            - If an expected field is provided, ask ONLY for that field.
+            - If fulfillment is not set, ask: pickup or delivery?
+            - Do not ask for email.
+            Context:
+            - Cart: {cart_items_text}
+            - Awaiting: fulfillment={cart.awaiting_fulfillment}, details={cart.awaiting_details}, confirmation={cart.awaiting_confirmation}
+            - Customer: {cart.customer_info}
+            - Fulfillment: {cart.fulfillment_type}
+            - Branch: {cart.branch_name}
+            - Payment: {cart.payment_method}
+            - Expected field: {expected_field}
+            - Missing details: {missing}
+            - Memory: {memory_context if memory_context else 'None'}
+            - User: {query}
+            Respond with at most two to three short sentences: an optional friendly acknowledgement and then ONE direct question for the expected/missing field using "you".If any detail is missing, you must ask for it in the second sentence. If the user has already provided the detail, you should thank them and ask for the next detail.
+            """
+            dual_api = DualAPISystem()
+            msg = (dual_api.generate_response_with_primary_api(prompt) or "Could you clarify what you'd like to do with your order?").strip()
+            return self._ok("order", msg, {"in_order_context": bool(cart.items)})
+        except Exception as e:
+            print(f"LLM clarification failed: {e}")
+            # Delegate even on failure with a neutral clarification
+            return self._ok("order", "Could you clarify what you'd like to do with your order?", {"in_order_context": bool(cart.items)})
+
+    def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str, memory_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Single gateway for order finalization - called from one place only."""
         print("DEBUG: Entering _finalize_order method.")
         print(f"DEBUG: Cart state before finalization: {cart.__dict__}")
 
         if not cart.items:
             print("DEBUG: Cart is empty. Cannot finalize order.")
-            return self._ok(
-                "order",
-                "I notice your cart is empty! Please add some items to your order first. You can say something like 'Add 2 chocolate cakes' or 'I'd like 1 bread and 3 cookies'.",
-                {
-                    "order_placed": False, 
-                    "cart_empty": True,
-                    "needs_items": True,
-                    "note": "Your cart is empty. Please add some items before confirming."
-                }
-            )
+            return self._llm_clarify_next_step("Your cart is empty; please specify items to add.", cart, memory_context, db)
 
         # Final stock check
         for item in cart.items:
@@ -558,10 +954,13 @@ class OrderAgent(BaseAgent):
             print(f"DEBUG: Checking stock for product {product.name}. Available: {product.quantity_in_stock}, Needed: {item['quantity']}")
             if product.quantity_in_stock < item['quantity']:
                 print(f"DEBUG: Insufficient stock for product {product.name}.")
-                return {
-                    "order_placed": False, 
-                    "note": f"Sorry, we only have {product.quantity_in_stock} {product.name} in stock. Would you like to adjust your order?"
-                }
+                qty = item['quantity']
+                return self._llm_clarify_next_step(
+                    f"Only {product.quantity_in_stock} {product.name} available; need {qty}.",
+                    cart,
+                    memory_context,
+                    db,
+                )
 
         print("DEBUG: Stock check passed. Proceeding to create customer and order.")
 
@@ -644,7 +1043,7 @@ class OrderAgent(BaseAgent):
         products_to_refresh = [item['product'] for item in cart.items]
 
         print("DEBUG: About to start commit process...")
-        
+
         # Commit all changes to the database
         print(f"DEBUG: About to commit changes. Stock before commit:")
         for product in products_to_refresh:
@@ -723,11 +1122,11 @@ class OrderAgent(BaseAgent):
             "order_confirmed",
             f"Order #{order.id} confirmed successfully!",
             {
-                "order_placed": True,
-                "order_id": order.id,
-                "receipt_text": receipt_text,
+            "order_placed": True,
+            "order_id": order.id,
+            "receipt_text": receipt_text,
                 "note": f"Order #{order.id} confirmed successfully!"
-            }
+        }
         )
 
     # --- New: business hour validation ---
@@ -850,14 +1249,14 @@ class OrderAgent(BaseAgent):
         # Check for strong confirmation
         return any(phrase in ql for phrase in strong_confirmations)
 
-    def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str) -> Dict[str, Any]:
+    def _finalize_order(self, db: Session, cart: ShoppingCart, session_id: str, memory_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Single gateway for order finalization - called from one place only."""
         print("DEBUG: Entering _finalize_order method.")
         print(f"DEBUG: Cart state before finalization: {cart.__dict__}")
 
         if not cart.items:
             print("DEBUG: Cart is empty. Cannot finalize order.")
-            return {"order_placed": False, "note": "Your cart is empty. Please add some items before confirming."}
+            return self._llm_clarify_next_step("Your cart is empty; please specify items to add.", cart, memory_context, db)
 
         # Final stock check
         for item in cart.items:
@@ -865,10 +1264,13 @@ class OrderAgent(BaseAgent):
             print(f"DEBUG: Checking stock for product {product.name}. Available: {product.quantity_in_stock}, Needed: {item['quantity']}")
             if product.quantity_in_stock < item['quantity']:
                 print(f"DEBUG: Insufficient stock for product {product.name}.")
-                return {
-                    "order_placed": False, 
-                    "note": f"Sorry, we only have {product.quantity_in_stock} {product.name} in stock. Would you like to adjust your order?"
-                }
+                qty = item['quantity']
+                return self._llm_clarify_next_step(
+                    f"Only {product.quantity_in_stock} {product.name} available; need {qty}.",
+                    cart,
+                    memory_context,
+                    db,
+                )
 
         print("DEBUG: Stock check passed. Proceeding to create customer and order.")
 
@@ -947,11 +1349,11 @@ class OrderAgent(BaseAgent):
             "order_confirmed",
             f"Order #{order.id} confirmed successfully!",
             {
-                "order_placed": True,
-                "order_id": order.id,
-                "receipt_text": receipt_text,
+            "order_placed": True,
+            "order_id": order.id,
+            "receipt_text": receipt_text,
                 "note": f"Order #{order.id} confirmed successfully!"
-            }
+        }
         )
 
     def _print_db_status(self, db: Session):
@@ -1078,12 +1480,64 @@ class OrderAgent(BaseAgent):
                     print(f"[CART] Items: {[(item['product'].name, item['quantity']) for item in cart.items]}")
                     print(f"[CART] Total: ${cart.get_total():.2f}")
             
+            # If user utterance looks like a time and we're in pickup flow, set pickup_time directly
+            try:
+                if (cart.fulfillment_type == 'pickup'):
+                    m_time = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", query, re.IGNORECASE)
+                    if m_time:
+                        hh = int(m_time.group(1)) % 12
+                        mm = int(m_time.group(2) or 0)
+                        if m_time.group(3).lower() == 'pm':
+                            hh += 12
+                        # store a simple HH:MM 24h string for now
+                        cart.pickup_info['pickup_time'] = f"{hh:02d}:{mm:02d}"
+                        cart.awaiting_details = False
+                        print(f"[CART] Set pickup_time from user query: {cart.pickup_info['pickup_time']}")
+            except Exception:
+                pass
+
             # NEW: Use LLM for COMPLETE order management - no hardcoded logic
             print("\n[LLM PHASE 1] Initial order analysis with Enhanced API...")
             print("[LLM] Calling _handle_order_with_llm()...")
             
+            # Deterministic entity-based add-to-cart fallback before LLM (uses NLU extraction)
+            try:
+                if session and isinstance(session[-1], dict) and session[-1].get("role") == "nlu":
+                    nlu = session[-1].get("message") or {}
+                    # Items
+                    prod_name = nlu.get("product")
+                    qty = int(nlu.get("quantity") or 0)
+                    if prod_name and qty > 0:
+                        print(f"[NLU FALLBACK] Adding {qty}x {prod_name} to cart based on extracted entities")
+                        self._add_item_to_cart(cart, prod_name, qty, db)
+                    # Customer details
+                    if nlu.get("name"):
+                        cart.customer_info['name'] = nlu.get("name")
+                    if nlu.get("phone_number"):
+                        cart.customer_info['phone_number'] = nlu.get("phone_number")
+                    pm = (nlu.get("payment_method") or '').lower()
+                    if pm in ('cash','card','upi'):
+                        cart.payment_method = pm
+                    # Fulfillment
+                    fulf = (nlu.get("fulfillment") or nlu.get("fulfillment_preference") or '').lower()
+                    if fulf in ('pickup','delivery'):
+                        cart.fulfillment_type = fulf
+                        cart.awaiting_fulfillment = False
+                    # Times and addresses
+                    if nlu.get("pickup_time"):
+                        cart.pickup_info['pickup_time'] = nlu.get("pickup_time")
+                    if nlu.get("address"):
+                        cart.delivery_info['address'] = nlu.get("address")
+                    if nlu.get("delivery_time"):
+                        cart.delivery_info['delivery_time'] = nlu.get("delivery_time")
+                    # Branch
+                    if nlu.get("branch"):
+                        cart.branch_name = nlu.get("branch")
+            except Exception as e:
+                print(f"[NLU FALLBACK] Failed to apply entity-based add-to-cart: {e}")
+
             # Let LLM handle the entire order flow based on context
-            order_action = self._handle_order_with_llm(query, cart, memory_context, db)
+            order_action = self._handle_order_with_llm(query, cart, memory_context, db, session)
             print(f"[LLM] _handle_order_with_llm() returned: {order_action}")
             
             # Apply LLM decisions to cart state
@@ -1093,18 +1547,74 @@ class OrderAgent(BaseAgent):
                 for i, update in enumerate(order_action["cart_updates"]):
                     print(f"[CART UPDATE {i+1}] Type: {update['type']}, Data: {update}")
                     if update["type"] == "add_item":
-                        print(f"[CART UPDATE] Adding {update['quantity']}x {update['product']} to cart")
-                        self._add_item_to_cart(cart, update["product"], update["quantity"], db)
+                        # Avoid double-adding: only add if this exact product/quantity not already present from NLU fallback
+                        try:
+                            prod = str(update.get('product') or '').strip()
+                            qty = int(update.get('quantity') or 0)
+                            already = any((it['product'].name.lower().find(prod.lower()) >= 0 and it['quantity'] >= qty) for it in cart.items)
+                            if not already and prod and qty > 0:
+                                print(f"[CART UPDATE] Adding {qty}x {prod} to cart (not duplicate)")
+                                self._add_item_to_cart(cart, prod, qty, db)
+                            else:
+                                print(f"[CART UPDATE] Skipping add_item (duplicate or invalid)")
+                        except Exception as e:
+                            print(f"[CART UPDATE] add_item normalization failed: {e}")
                     elif update["type"] == "remove_item":
                         print(f"[CART UPDATE] Removing {update['product']} from cart")
                         self._remove_item_from_cart(cart, update["product"])
                     elif update["type"] == "update_customer_info":
-                        print(f"[CART UPDATE] Updating customer info: {update['info']}")
-                        cart.customer_info.update(update["info"])
+                        info = update.get("info") or {}
+                        print(f"[CART UPDATE] Normalizing customer info: {info}")
+                        # Support {field, value} shape from LLM
+                        if set(info.keys()) == {"field", "value"}:
+                            k = str(info.get("field") or "").strip()
+                            v = info.get("value")
+                            info = {k: v}
+                        # Map fields to correct structures
+                        if 'name' in info:
+                            cart.customer_info['name'] = info['name']
+                        if 'phone' in info:
+                            cart.customer_info['phone_number'] = info['phone']
+                        if 'phone_number' in info:
+                            cart.customer_info['phone_number'] = info['phone_number']
+                        if 'payment_method' in info:
+                            pm = str(info['payment_method']).lower()
+                            if pm in ('cash','card','upi'):
+                                cart.payment_method = pm
+                        # Guard: never treat payment_method as fulfillment
+                        if 'fulfillment_type' in info and str(info['fulfillment_type']).lower() in ('cash','card','upi'):
+                            print("[CART UPDATE] Ignoring invalid fulfillment_type that looks like payment method")
+                        # Fulfillment specific
+                        if 'address' in info:
+                            cart.delivery_info['address'] = info['address']
+                        if 'delivery_time' in info:
+                            cart.delivery_info['delivery_time'] = info['delivery_time']
+                        if 'pickup_time' in info:
+                            cart.pickup_info['pickup_time'] = info['pickup_time']
+                        if 'branch' in info:
+                            cart.branch_name = info['branch']
                     elif update["type"] == "set_fulfillment":
-                        print(f"[CART UPDATE] Setting fulfillment type: {update['fulfillment_type']}")
-                        cart.fulfillment_type = update["fulfillment_type"]
-                        cart.awaiting_fulfillment = False
+                        # Support LLM using set_fulfillment to set time/branch; normalize
+                        info = update.get("info") or {}
+                        if 'pickup_time' in info:
+                            cart.pickup_info['pickup_time'] = info['pickup_time']
+                            print(f"[CART UPDATE] Set pickup_time: {cart.pickup_info['pickup_time']}")
+                        if 'delivery_time' in info:
+                            cart.delivery_info['delivery_time'] = info['delivery_time']
+                            print(f"[CART UPDATE] Set delivery_time: {cart.delivery_info['delivery_time']}")
+                        if 'branch' in info:
+                            cart.branch_name = info['branch']
+                            print(f"[CART UPDATE] Set branch: {cart.branch_name}")
+                        ft = (update.get("fulfillment_type") or '').lower()
+                        if ft in ('pickup','delivery'):
+                            print(f"[CART UPDATE] Setting fulfillment type: {ft}")
+                            cart.fulfillment_type = ft
+                            cart.awaiting_fulfillment = False
+                        elif info:
+                            # If only details provided (time/branch), do not force invalid fulfillment
+                            print("[CART UPDATE] Fulfillment details updated without changing fulfillment type")
+                        else:
+                            print(f"[CART UPDATE] Ignoring invalid fulfillment type from LLM: {ft}")
             else:
                 print("[CART UPDATES] No cart updates from LLM")
             
@@ -1116,6 +1626,20 @@ class OrderAgent(BaseAgent):
                 cart.awaiting_confirmation = order_action["cart_state"].get("awaiting_confirmation", False)
                 cart.awaiting_fulfillment = order_action["cart_state"].get("awaiting_fulfillment", True)
                 print(f"[CART STATE] Updated cart flags: awaiting_details={cart.awaiting_details}, awaiting_confirmation={cart.awaiting_confirmation}, awaiting_fulfillment={cart.awaiting_fulfillment}")
+                # Server-side guard: do not allow awaiting_confirmation unless details complete
+                missing_for_confirmation = self._get_missing_details(cart)
+                if cart.awaiting_confirmation and (missing_for_confirmation or not cart.fulfillment_type):
+                    print(f"[CART STATE GUARD] Confirmation blocked; missing details: {missing_for_confirmation} or fulfillment not set")
+                    cart.awaiting_confirmation = False
+                    cart.awaiting_details = True
+                    if missing_for_confirmation:
+                        cart.expected_field = missing_for_confirmation[0]
+                    return self._llm_clarify_next_step(
+                        f"Collect missing: {', '.join(missing_for_confirmation)}." if missing_for_confirmation else "Please collect fulfillment details (pickup or delivery).",
+                        cart,
+                        memory_context,
+                        db,
+                    )
             else:
                 print("[CART STATE] No cart state updates from LLM")
 
@@ -1124,47 +1648,48 @@ class OrderAgent(BaseAgent):
             print("[LLM] Calling _analyze_order_flow_with_llm()...")
             
             # Let LLM analyze the query and decide what to do
-            order_flow_decision = self._analyze_order_flow_with_llm(query, cart, memory_context, db)
+            order_flow_decision = self._analyze_order_flow_with_llm(query, cart, memory_context, db, session)
             print(f"[LLM] _analyze_order_flow_with_llm() returned: {order_flow_decision}")
             
             # Apply LLM decisions
             print("\n[LLM DECISIONS] Processing LLM flow decisions...")
             if order_flow_decision.get("action") == "clear_cart":
-                print("[LLM DECISION] Action: clear_cart - Clearing cart...")
-                cart.clear()
-                print("[CART] Cart cleared successfully")
-                return self._ok("clear_cart", "Your cart has been cleared.", {"cart_cleared": True})
-            
+                print("[LLM DECISION] Action: clear_cart - IGNORED (requires explicit user command)")
+                return self._llm_clarify_next_step("Do you want to clear your cart?", cart, memory_context, db)
+                
             elif order_flow_decision.get("action") == "checkout":
                 print("[LLM DECISION] Action: checkout - Processing checkout flow...")
                 # LLM has already added items if needed
                 if not cart.items:
-                    print("[CHECKOUT] Cart is empty - asking for items")
-                    return self._ok("checkout", "Your cart is empty. Please add some items before checking out.", {"needs_items": True})
+                    print("[CHECKOUT] Cart is empty - delegating to LLM for items")
+                    return self._llm_clarify_next_step("Your cart is empty; please specify items to add.", cart, memory_context, db)
                 
+                # If fulfillment not set, ask LLM to collect it
+                if not cart.fulfillment_type:
+                    print("[CHECKOUT] Fulfillment not set - delegating to LLM for clarification")
+                    cart.awaiting_fulfillment = True
+                    return self._llm_clarify_next_step("Please collect fulfillment details (pickup or delivery).", cart, memory_context, db)
+
                 # Check what's missing based on LLM analysis
                 print("[CHECKOUT] Checking for missing details...")
                 missing_details = self._get_missing_details(cart)
                 if missing_details:
                     print(f"[CHECKOUT] Missing details found: {missing_details}")
                     cart.awaiting_details = True
-                    return self._ask_for_missing_details(cart, missing_details)
+                    cart.expected_field = missing_details[0]
+                    return self._llm_clarify_next_step(f"Collect missing: {', '.join(missing_details)}.", cart, memory_context, db)
                 
-                # Ready for confirmation
-                print("[CHECKOUT] All details complete - ready for confirmation")
+                # Ready for confirmation -> show preview receipt first
+                print("[CHECKOUT] All details complete - showing preview receipt")
                 cart.awaiting_confirmation = True
+                preview_receipt = self._build_preview_receipt(cart)
                 return self._ok(
-                    "confirm_order",
-                    "Please confirm your order.",
+                    "order",
+                    "Perfect! Here's your order summary. Please review and confirm:",
                     {
-                        "ready_to_confirm": True,
-                        "cart_summary": cart.get_summary(),
-                        "fulfillment": cart.fulfillment_type,
-                        "customer": cart.customer_info,
-                        "delivery": cart.delivery_info,
-                        "pickup": cart.pickup_info,
-                        "payment_method": cart.payment_method,
-                        "total": cart.get_total(),
+                        "in_order_context": True,
+                        "preview_receipt_text": preview_receipt,
+                        "awaiting_confirmation": True
                     }
                 )
             
@@ -1181,375 +1706,97 @@ class OrderAgent(BaseAgent):
                 cart.fulfillment_type = order_flow_decision.get("fulfillment_type")
                 cart.awaiting_fulfillment = False
                 print(f"[CART] Fulfillment type set to: {cart.fulfillment_type}")
-                
+
                 # Move to next step
                 print("[FULFILLMENT] Checking for missing details...")
                 missing_details = self._get_missing_details(cart)
                 if missing_details:
                     print(f"[FULFILLMENT] Missing details found: {missing_details}")
                     cart.awaiting_details = True
-                    return self._ask_for_missing_details(cart, missing_details)
-                print("[FULFILLMENT] All details complete - moving to confirmation")
+                    cart.expected_field = missing_details[0]
+                    return self._llm_clarify_next_step(f"Collect missing: {', '.join(missing_details)}.", cart, memory_context, db)
+                print("[FULFILLMENT] All details complete - showing preview receipt")
                 cart.awaiting_confirmation = True
-                return self._ok("confirm_order", "Please confirm your order.", {"ready_to_confirm": True, "cart_summary": cart.get_summary(), "fulfillment": cart.fulfillment_type})
-            
+                preview_receipt = self._build_preview_receipt(cart)
+                return self._ok(
+                    "order",
+                    "Great! Here's your order summary. Please review and confirm:",
+                    {
+                        "in_order_context": True,
+                        "preview_receipt_text": preview_receipt,
+                        "awaiting_confirmation": True
+                    }
+                )
+
             elif order_flow_decision.get("action") == "collect_details":
                 print(f"[LLM DECISION] Action: collect_details - Collecting missing details: {order_flow_decision.get('missing_details', [])}")
                 cart.awaiting_details = True
-                return self._ask_for_missing_details(cart, order_flow_decision.get("missing_details", []))
+                missing_details = order_flow_decision.get("missing_details", [])
+                if missing_details:
+                    cart.expected_field = missing_details[0]
+                return self._llm_clarify_next_step(
+                    f"Collect missing: {', '.join(missing_details)}." if missing_details else "Please provide the missing details.",
+                    cart,
+                    memory_context,
+                    db,
+                )
             
             elif order_flow_decision.get("action") == "confirm_order":
                 print("[LLM DECISION] Action: confirm_order - Processing order confirmation...")
+                # Server-side guard: ensure all required details are present before finalization
+                guard_missing = self._get_missing_details(cart)
+                if guard_missing or not cart.fulfillment_type:
+                    print(f"[CONFIRMATION GUARD] Missing details before confirmation: {guard_missing}, fulfillment={cart.fulfillment_type}")
+                    cart.awaiting_confirmation = False
+                    cart.awaiting_details = True
+                    if guard_missing:
+                        cart.expected_field = guard_missing[0]
+                    return self._llm_clarify_next_step(
+                        f"Collect missing: {', '.join(guard_missing)}." if guard_missing else "Please collect fulfillment details (pickup or delivery).",
+                        cart,
+                        memory_context,
+                        db,
+                    )
+
                 if cart.awaiting_confirmation:
                     print("[CONFIRMATION] Order awaiting confirmation - finalizing...")
                     cart.last_prompt = "confirm_order"
-                    return self._finalize_order(db, cart, session_id)
+                    return self._finalize_order(db, cart, session_id, memory_context)
                 else:
                     print("[CONFIRMATION] No order awaiting confirmation")
-                    return self._ok(
-                        "confirm_order",
-                        "I don't see an order awaiting confirmation. Would you like me to start a new order or review your cart?",
-                        {"in_order_context": bool(cart.items), "cart_items": len(cart.items)}
-                    )
+                    return self._llm_clarify_next_step("Ask for order confirmation or offer to review cart.", cart, memory_context, db)
             
             elif order_flow_decision.get("action") == "show_receipt":
                 print("[LLM DECISION] Action: show_receipt - Displaying order receipt...")
                 if session_id in self.last_receipt_by_session:
                     print(f"[RECEIPT] Found receipt for session {session_id}")
-                    return self._ok("order_receipt", "Here is your latest order receipt:", {"receipt_text": self.last_receipt_by_session[session_id]})
+                    return self._ok("order_receipt", self.last_receipt_by_session[session_id], {"receipt_text": self.last_receipt_by_session[session_id]})
                 print("[RECEIPT] No receipt found for this session")
-                return self._ok("order_receipt", "I don't see a recent order receipt yet. Would you like me to review your cart or place a new order?", {"receipt_available": False, "in_order_context": True})
+                return self._llm_clarify_next_step("No receipt yet; offer to review cart or start new order.", cart, memory_context, db)
             
-            # If LLM didn't provide a clear action, use fallback
-            print("[LLM] No clear action from LLM, using fallback logic")
-            
-            # Handle ongoing checkout flow states
-            print("\n[FALLBACK] Processing ongoing checkout flow states...")
-            if cart.awaiting_details:
-                print("[FALLBACK] Cart is awaiting details - checking what's missing...")
-                # Check if all required details are present now
-                missing_details = self._get_missing_details(cart)
+            elif order_flow_decision.get("action") == "modify_cart":
+                print("[LLM DECISION] Action: modify_cart - Handling cart modifications...")
+                modifications = order_flow_decision.get("modifications", {})
+                mod_type = modifications.get("type")
                 
-                if missing_details:
-                    # Still missing details, ask for them using helper method
-                    print(f"[FALLBACK] Still missing details: {missing_details}")
-                    return self._ask_for_missing_details(cart, missing_details)
-                
-                # All details are complete. Show a full receipt-style preview and ask for confirmation.
-                print("[FALLBACK] All details complete - building receipt preview...")
-                cart.awaiting_details = False
-                cart.awaiting_confirmation = True
-                preview_text = cart.build_receipt()
-                print("[FALLBACK] Receipt preview built - asking for confirmation")
-                return self._ok(
-                    "confirm_order",
-                    "Please review your order below and confirm if everything looks good.",
-                    {
-                        "ready_to_confirm": True,
-                        "preview_receipt_text": preview_text,
-                        "in_order_context": True,
-                    }
-                )
-            
-            # Handle order confirmation - SINGLE GATEWAY
-            if cart.awaiting_confirmation and self._is_strong_confirmation(query):
-                print("[FALLBACK] Order confirmation detected - finalizing order...")
-                cart.last_prompt = "confirm_order"
-                return self._finalize_order(db, cart, session_id)
-            
-            # 1. Extract entities from current message
-            print("\n[ENTITY EXTRACTION] Starting entity extraction...")
-            ent = self.entity_extractor.extract(query)
-            print(f"[ENTITY EXTRACTION] Entities extracted: {ent}")
-
-            # Update cart with any provided details (name/phone/time/address)
-            if ent.get("name"):
-                # Avoid setting name to a product name (e.g., "Almond Croissant")
-                try:
-                    known_product_names = {row[0].lower() for row in db.query(Product.name).all()}
-                except Exception:
-                    known_product_names = set()
-                proposed_name = ent["name"].strip()
-                if proposed_name.lower() not in known_product_names and "croissant" not in proposed_name.lower():
-                    cart.customer_info["name"] = proposed_name
-            if ent.get("phone_number"):
-                cart.customer_info["phone_number"] = ent["phone_number"]
-            else:
-                # Fallback: capture bare phone numbers (7-15 digits) in free text
-                phone_match = re.search(r"(?<!\d)(\+?\d[\d\s\-]{6,14}\d)(?!\d)", query)
-                if phone_match and not cart.customer_info.get("phone_number"):
-                    cart.customer_info["phone_number"] = re.sub(r"[^\d\+]", "", phone_match.group(1))
-            if ent.get("time"):
-                if cart.fulfillment_type == 'pickup':
-                    # validate time window 8:00–18:00
-                    if self._is_time_within_business_hours(ent["time"], cart.branch_name):
-                        cart.pickup_info["pickup_time"] = ent["time"]
-                    else:
-                        return self._ok("checkout_missing_details", "Our pickup window is 8 AM–6 PM. What pickup time works for you within that window?", {"asking_for": "pickup_time", "in_order_context": True})
-                elif cart.fulfillment_type == 'delivery':
-                    if self._is_time_within_business_hours(ent["time"], cart.branch_name):
-                        cart.delivery_info["delivery_time"] = ent["time"]
-                    else:
-                        return self._ok("checkout_missing_details", "Our delivery window is 8 AM–6 PM. What time should we deliver within that window?", {"asking_for": "delivery_time", "in_order_context": True})
-            if ent.get("payment_method"):
-                cart.payment_method = ent["payment_method"]
-
-            # Naive address extraction (number + street + type)
-            print("\n[ADDRESS EXTRACTION] Checking for delivery address...")
-            addr_match = re.search(r"(\d{1,5}\s+[A-Za-z0-9\.,\-\s]+\s+(Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Lane|Ln\.?|Boulevard|Blvd\.?|Drive|Dr\.?))", query, flags=re.IGNORECASE)
-            if addr_match:
-                extracted_address = addr_match.group(1).strip()
-                cart.delivery_info["address"] = extracted_address
-                print(f"[ADDRESS] Delivery address extracted: {extracted_address}")
-            else:
-                print("[ADDRESS] No delivery address found in query")
-            
-            # Branch selection detection
-            print("\n[BRANCH DETECTION] Checking for branch selection...")
-            branch_keywords = {
-                'downtown': 'Downtown Location',
-                'westside': 'Westside Location', 
-                'mall': 'Mall Location'
-            }
-            
-            query_lower = query.lower()
-            for keyword, branch_name in branch_keywords.items():
-                if keyword in query_lower:
-                    cart.branch_name = branch_name
-                    print(f"[BRANCH] Branch selected: {branch_name}")
-                    break
-            else:
-                print("[BRANCH] No branch selection detected in query")
-            
-            # Get product name from entities or from context
-            print("\n[PRODUCT DETECTION] Determining product from entities and context...")
-            product_name = ent.get("product") or ent.get("product_name")
-            print(f"[PRODUCT] Product from entities: {product_name}")
-            
-            # If no product in current message, check previous messages for context
-            if not product_name:
-                print("[PRODUCT] No product in current message - checking session history...")
-                for i, msg in enumerate(reversed(session)):
-                    try:
-                        raw = msg.get('message') if isinstance(msg, dict) else ''
-                        if raw is None:
-                            continue
-                        if not isinstance(raw, str):
-                            raw = str(raw)
-                        msg_content = raw.lower()
-                        print(f"[PRODUCT] Checking message {len(session)-i}: {msg_content[:50]}...")
-                    except Exception as e:
-                        print(f"[PRODUCT ERROR] Failed to process message: {e}")
-                        msg_content = ''
-                    if 'cheesecake' in msg_content or 'cheese cake' in msg_content:
-                        product_name = 'cheesecake'
-                        print(f"[PRODUCT] Found 'cheesecake' in message {len(session)-i}")
-                        break
-                    elif 'chocolate' in msg_content:
-                        product_name = 'chocolate fudge cake'
-                        print(f"[PRODUCT] Found 'chocolate' in message {len(session)-i}")
-                        break
-                    elif 'croissant' in msg_content:
-                        product_name = 'croissant'
-                        print(f"[PRODUCT] Found 'croissant' in message {len(session)-i}")
-                        break
-            else:
-                print(f"[PRODUCT] Product already determined: {product_name}")
-                
-            print(f"[PRODUCT] Final product name: {product_name}")
-            
-            # Determine if it's pickup or delivery
-            # Prefer robust detector; fall back to simple heuristics and extracted entity
-            ful_det = self._detect_fulfillment(query)
-            is_pickup = (ful_det == 'pickup') or any(term in query.lower() for term in ["pickup", "pick up", "pick-up", "pic up", "come get", "come pick up"]) or ent.get("fulfillment") == "pickup"
-            is_delivery = (ful_det == 'delivery') or any(term in query.lower() for term in ["deliver", "delivery", "deliver it", "send to"]) or ent.get("fulfillment") == "delivery"
-            print(f"DEBUG: Is pickup: {is_pickup}")
-            
-            # Set fulfillment type (do not default silently)
-            try:
-                if is_pickup:
-                    cart.fulfillment_type = 'pickup'
-                    fulfillment = FulfillmentType.pickup
-                    print("DEBUG: Fulfillment decided as pickup (detector/heuristics)")
-                elif is_delivery:
-                    cart.fulfillment_type = 'delivery'
-                    fulfillment = FulfillmentType.delivery
-                    print("DEBUG: Fulfillment decided as delivery (detector/heuristics)")
+                if mod_type == "change_fulfillment":
+                    cart.awaiting_fulfillment = True
+                    return self._llm_clarify_next_step("What would you like to change about fulfillment? (pickup/delivery, time, address, etc.)", cart, memory_context, db)
+                elif mod_type == "change_customer_info":
+                    cart.awaiting_details = True
+                    return self._llm_clarify_next_step("What customer information would you like to change? (name, phone, etc.)", cart, memory_context, db)
+                elif mod_type == "change_items":
+                    cart.awaiting_details = True
+                    return self._llm_clarify_next_step("What items would you like to change? (add, remove, modify quantities)", cart, memory_context, db)
+                elif mod_type == "change_payment":
+                    cart.awaiting_details = True
+                    return self._llm_clarify_next_step("What payment method would you like to use? (cash, card, upi)", cart, memory_context, db)
                 else:
-                    fulfillment = None
-                print(f"DEBUG: Fulfillment type set to: {fulfillment}")
-            except Exception as e:
-                print(f"ERROR: Failed to set fulfillment type: {e}")
-                return self._ok("order", "I'm having trouble with the order type. Please specify if this is for pickup or delivery.", {"order_placed": False, "reason": "fulfillment_type_error"})
+                    return self._llm_clarify_next_step("What would you like to modify in your order?", cart, memory_context, db)
             
-            # --- Multi-item parsing ---
-            print("\n[MULTI-ITEM PARSING] Searching for products in query...")
-            ql_full = query.lower()
-            print(f"[MULTI-ITEM] Query (lowercase): {ql_full}")
-            
-            print("[DATABASE] Querying all products for name matching...")
-            db_products = db.query(Product).all()
-            print(f"[DATABASE] Found {len(db_products)} products in database")
-            
-            found_items = []  # list of tuples (Product, quantity)
-
-            for p in db_products:
-                pname = p.name.lower()
-                print(f"[MULTI-ITEM] Checking product: {pname}")
-                if pname in ql_full:
-                    print(f"[MULTI-ITEM] Product '{pname}' found in query!")
-                    # quantity immediately preceding the product name (e.g., '3 chocolate fudge cake')
-                    qty = 1
-                    qty_match = re.search(r"(\d{1,3})\s+[a-z\s]*" + re.escape(pname), ql_full)
-                    if qty_match:
-                        try:
-                            qty = int(qty_match.group(1))
-                            print(f"[MULTI-ITEM] Quantity extracted: {qty}")
-                        except Exception as e:
-                            print(f"[MULTI-ITEM] Failed to parse quantity, using default: 1 (error: {e})")
-                            qty = 1
-                    else:
-                        print(f"[MULTI-ITEM] No quantity specified, using default: 1")
-                    found_items.append((p, qty))
-                    print(f"[MULTI-ITEM] Added to found_items: {p.name} x {qty}")
-                else:
-                    print(f"[MULTIITEM] Product '{pname}' not found in query")
-            
-            print(f"[MULTI-ITEM] Total items found: {len(found_items)}")
-            for p, qty in found_items:
-                print(f"[MULTI-ITEM] - {p.name} x {qty}")
-
-            # Fallback to single-entity product if nothing detected via scan
-            print("\n[FALLBACK] Checking for single-entity product fallback...")
-            if not found_items and product_name:
-                print(f"[FALLBACK] No items found via scan, trying product_name: {product_name}")
-                print("[DATABASE] Querying product by name pattern...")
-                product = db.query(Product).filter(Product.name.ilike(f"%{product_name}%")).first()
-                if product:
-                    print(f"[FALLBACK] Found product: {product.name}")
-                    try:
-                        quantity = int(ent.get("quantity", 1))
-                        print(f"[FALLBACK] Quantity from entities: {quantity}")
-                    except (ValueError, TypeError) as e:
-                        print(f"[FALLBACK] Failed to parse quantity, using default: 1 (error: {e})")
-                        quantity = 1
-                    found_items.append((product, quantity))
-                    print(f"[FALLBACK] Added fallback item: {product.name} x {quantity}")
-                else:
-                    print(f"[FALLBACK] No product found matching pattern: {product_name}")
-            else:
-                print(f"[FALLBACK] Fallback not needed - found_items: {len(found_items)}, product_name: {product_name}")
-
-            if not found_items:
-                print("[NO ITEMS] No products detected in query...")
-                # Check if we're in an ongoing order context - don't ask for clarification
-                if cart.items or cart.awaiting_fulfillment or cart.awaiting_details or cart.awaiting_confirmation:
-                    # We're in order context but no new products found - continue with existing cart
-                    print("[NO ITEMS] In order context, no new products found, continuing with existing cart.")
-                else:
-                    print("[NO ITEMS] No products detected in query; asking user to specify.")
-                    return self._clarify("order", "What item would you like to order?")
-
-            # Stock check for all items first
-            print("\n[STOCK CHECK] Verifying product availability...")
-            for product, qty in found_items:
-                print(f"[STOCK CHECK] Checking stock for {product.name}. Available: {product.quantity_in_stock}, Needed: {qty}")
-                if product.quantity_in_stock < qty:
-                    print(f"[STOCK CHECK] Insufficient stock for {product.name}")
-                    print("[DATABASE] Querying alternatives in same category...")
-                    alternatives = db.query(Product).filter(Product.quantity_in_stock > 0, Product.category == product.category).limit(3).all()
-                    print(f"[STOCK CHECK] Found {len(alternatives)} alternatives: {[a.name for a in alternatives]}")
-                    return self._ok(
-                        "order",
-                        f"We only have {product.quantity_in_stock} {product.name}(s) available.",
-                        {
-                            "order_placed": False,
-                            "reason": "insufficient_stock",
-                            "available_quantity": product.quantity_in_stock,
-                            "product_name": product.name,
-                            "alternatives": [a.name for a in alternatives]
-                        }
-                    )
-                else:
-                    print(f"[STOCK CHECK] Sufficient stock for {product.name}: {product.quantity_in_stock} >= {qty}")
-
-            # Add all items to cart
-            print("\n[CART ADDITION] Adding items to shopping cart...")
-            for product, qty in found_items:
-                print(f"[CART ADDITION] Adding {qty}x {product.name} to cart...")
-                cart.add_item(product, qty)
-                print(f"[CART ADDITION] Added successfully. Cart now has {len(cart.items)} items")
-
-            # Build upsell suggestions (exclude already added products)
-            print("\n[UPSELL] Building upsell suggestions...")
-            added_ids = {p.id for p, _ in found_items}
-            print(f"[UPSELL] Added product IDs: {added_ids}")
-            print("[DATABASE] Querying for upsell suggestions...")
-            suggestions = db.query(Product).filter(Product.quantity_in_stock > 0).filter(~Product.id.in_(list(added_ids))).limit(2).all()
-            upsell_names = [s.name for s in suggestions]
-            print(f"[UPSELL] Found {len(suggestions)} suggestions: {upsell_names}")
-
-            # If fulfillment not yet chosen, ask for it now along with confirmation of added items
-            print("\n[FULFILLMENT CHECK] Checking if fulfillment type is set...")
-            if not cart.fulfillment_type:
-                print("[FULFILLMENT CHECK] No fulfillment type set - asking user...")
-                cart.awaiting_fulfillment = True
-                added_summary = ", ".join([f"{qty}x {p.name}" for p, qty in found_items])
-                print(f"[FULFILLMENT CHECK] Added summary: {added_summary}")
-                print(f"[FULFILLMENT CHECK] Cart now has {len(cart.items)} items")
-                return self._ok(
-                    "checkout_fulfillment",
-                    f"Added {added_summary} to your cart. Would you like delivery or pickup?",
-                    {"needs_fulfillment_type": True, "cart_items": len(cart.items), "cart_summary": cart.get_summary(), "upsell_suggestions": upsell_names}
-                )
-            else:
-                print(f"[FULFILLMENT CHECK] Fulfillment type already set: {cart.fulfillment_type}")
-
-            # If branch not selected yet, ask for it now (for both pickup and delivery)
-            print("\n[BRANCH CHECK] Checking if branch is selected...")
-            if not cart.branch_name:
-                try:
-                    locations = self._load_locations()
-                    branches = [loc["name"] for loc in locations]
-                except Exception:
-                    branches = ["Downtown Location", "Westside Location", "Mall Location"]
-                return self._ok(
-                    "checkout_missing_details",
-                    "Which branch should we use for your order? (Downtown, Westside, or Mall)",
-                    {"asking_for": "branch", "branches": branches, "in_order_context": True}
-                )
-
-            # If fulfillment chosen, proceed with missing details
-            print("\n[MISSING DETAILS] Checking for missing required details...")
-            missing_details = self._get_missing_details(cart)
-            if missing_details:
-                print(f"[MISSING DETAILS] Found missing details: {missing_details}")
-                cart.awaiting_details = True
-                print("[MISSING DETAILS] Setting cart to await details...")
-                ask = self._ask_for_missing_details(cart, missing_details)
-                ask.facts["upsell_suggestions"] = upsell_names
-                print(f"[MISSING DETAILS] Returning request for details with upsell suggestions: {upsell_names}")
-                return ask
-            else:
-                print("[MISSING DETAILS] All required details are present!")
-
-            # All details present, ask for confirmation with receipt preview and include upsell
-            print("\n[CONFIRMATION] All details complete - preparing order confirmation...")
-            cart.awaiting_confirmation = True
-            print("[CONFIRMATION] Building receipt preview...")
-            preview_text = cart.build_receipt()
-            print(f"[CONFIRMATION] Receipt preview built ({len(preview_text)} characters)")
-            print(f"[CONFIRMATION] Upsell suggestions: {upsell_names}")
-            return self._ok(
-                "confirm_order",
-                "Please review your order below and confirm if everything looks good.",
-                {
-                    "ready_to_confirm": True,
-                    "preview_receipt_text": preview_text,
-                    "in_order_context": True,
-                    "upsell_suggestions": upsell_names
-                }
-            )
+            # If LLM didn't provide a clear action, delegate clarification to LLM
+            print("[LLM] No clear action from LLM; delegating clarification to LLM")
+            return self._llm_clarify_next_step(query, cart, memory_context, db)
            
         except Exception as e:
             print(f"\n{'='*80}")
@@ -1667,44 +1914,45 @@ class OrderAgent(BaseAgent):
     def _ask_for_missing_details(self, cart, missing_details: List[str]) -> AgentResult:
         """Helper method to ask for missing details."""
         if 'items' in missing_details:
-            return self._ok(
-                "checkout_missing_details", 
-                "I notice your cart is empty! Please add some items to your order first. You can say something like 'Add 2 chocolate cakes' or 'I'd like 1 bread and 3 cookies'.",
-                {
-                    "missing_details": missing_details, 
-                    "asking_for": "items", 
-                    "cart_empty": True,
-                    "in_order_context": True
-                }
-            )
+            cart.awaiting_details = True
+            cart.expected_field = 'items'
+            return self._llm_clarify_next_step("Your cart is empty; please specify items to add.", cart, {}, None)
         elif 'name' in missing_details:
-            return self._ok("checkout_missing_details", "Got it! What's the name for the order?", {"missing_details": missing_details, "asking_for": "name", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'name'
+            return self._llm_clarify_next_step("Collect missing: name.", cart, {}, None)
         elif 'branch' in missing_details:
-            try:
-                locations = self._load_locations()
-                branches = [loc["name"] for loc in locations]
-            except Exception:
-                branches = ["Downtown Location", "Westside Location", "Mall Location"]
-            return self._ok("checkout_missing_details", "Which branch should we use for your order? (Downtown, Westside, or Mall)", {"missing_details": missing_details, "asking_for": "branch", "branches": branches, "in_order_context": True})
+            return self._llm_clarify_next_step("Ask for branch selection (Downtown/Westside/Mall).", cart, {}, None)
         elif 'phone_number' in missing_details and cart.fulfillment_type == 'pickup':
-            return self._ok("checkout_missing_details", f"Thanks {cart.customer_info.get('name', '')}! For pickup, what's the best phone number to reach you?", {"missing_details": missing_details, "asking_for": "phone_number", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'phone_number'
+            return self._llm_clarify_next_step("Collect missing: phone_number.", cart, {}, None)
         elif 'pickup_time' in missing_details and cart.fulfillment_type == 'pickup':
-            # include branch hours hint
-            try:
-                from datetime import datetime
-                open_t, close_t = self._get_branch_hours_for_datetime(cart.branch_name or '', datetime.now())
-                window = f"{open_t.strftime('%-I:%M %p')}–{close_t.strftime('%-I:%M %p')}" if hasattr(open_t, 'strftime') else "business hours"
-            except Exception:
-                window = "business hours"
-            return self._ok("checkout_missing_details", f"Perfect! What pickup time works for you, {cart.customer_info.get('name', '')}? Our {cart.branch_name or 'branch'} window is {window}.", {"missing_details": missing_details, "asking_for": "pickup_time", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'pickup_time'
+            return self._llm_clarify_next_step("Collect missing: pickup_time.", cart, {}, None)
         elif 'address' in missing_details and cart.fulfillment_type == 'delivery':
-            return self._ok("checkout_missing_details", f"Thanks {cart.customer_info.get('name', '')}! What's the full delivery address?", {"missing_details": missing_details, "asking_for": "address", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'address'
+            return self._llm_clarify_next_step("Collect missing: address.", cart, {}, None)
         elif 'delivery_time' in missing_details and cart.fulfillment_type == 'delivery':
-            return self._ok("checkout_missing_details", f"Great! What delivery time works for you, {cart.customer_info.get('name', '')}?", {"missing_details": missing_details, "asking_for": "delivery_time", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'delivery_time'
+            return self._llm_clarify_next_step("Collect missing: delivery_time.", cart, {}, None)
         elif 'payment_method' in missing_details:
-            return self._ok("checkout_missing_details", f"Almost done, {cart.customer_info.get('name', '')}! How would you like to pay? (cash, card, or UPI)", {"missing_details": missing_details, "asking_for": "payment_method", "in_order_context": True})
+            cart.awaiting_details = True
+            cart.expected_field = 'payment_method'
+            return self._llm_clarify_next_step("Collect missing: payment_method.", cart, {}, None)
         else:
-            return self._ok("checkout_missing_details", "I need a few more details to place your order.", {"missing_details": missing_details, "in_order_context": True})
+            cart.awaiting_details = True
+            if missing_details:
+                cart.expected_field = missing_details[0]
+            return self._llm_clarify_next_step(
+                f"Collect missing: {', '.join(missing_details)}." if missing_details else "Please provide the missing details.",
+                cart,
+                {},
+                None,
+            )
 
     def _print_db_status(self, db):
         """Print current database status for debugging"""

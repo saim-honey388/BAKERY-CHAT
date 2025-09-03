@@ -5,6 +5,7 @@ from ..data.database import SessionLocal
 from ..data.models import Product
 from ..schemas.io_models import Citation
 from sqlalchemy import or_
+import json
 
 class ProductInfoAgent(BaseAgent):
     name = "product_info"
@@ -45,23 +46,18 @@ class ProductInfoAgent(BaseAgent):
             price_max = entities.get("price_max")
             requested_time = entities.get("time")
 
-            # Build database query
+            # Build database query (STRICT: DB is source of truth)
             db_query = db.query(Product)
 
-            # Search query against name, description, and category
+            # Search query against name and description only; prefer exact DB matches
             if q:
                 search_term = f"%{q}%"
-                # Simple category heuristics
-                category_terms = [cat for cat in ["cakes", "pastries", "breads", "specialty"] if cat.rstrip('s') in q or cat in q]
-                if category_terms:
-                    db_query = db_query.filter(Product.category.ilike(f"%{category_terms[0]}%"))
-                else:
-                    db_query = db_query.filter(
-                        or_(
-                            Product.name.ilike(search_term),
-                            Product.description.ilike(search_term)
-                        )
+                db_query = db_query.filter(
+                    or_(
+                        Product.name.ilike(search_term),
+                        Product.description.ilike(search_term)
                     )
+                )
 
             # Apply price filtering
             if price_min is not None:
@@ -89,8 +85,38 @@ class ProductInfoAgent(BaseAgent):
                 citations.append(Citation(source="database:products", snippet=", ".join([it["name"] for it in items_out[:5]])))
                 return self._ok(intent="product_info", facts=facts, context_docs=[], citations=citations)
 
-            # No matches -> ask for clarification
-            return self._clarify(intent="product_info", question="Which item or category are you interested in? e.g. 'chocolate cake' or 'pastries under $4'")
+            # No matches -> strict handling: do NOT invent items. Offer closest in-DB alternatives.
+            # Try a loose similarity on token(s) in the query to find suggestions
+            suggestions: List[Product] = []
+            try:
+                tokens = [t for t in q.lower().split() if len(t) > 2]
+                if tokens:
+                    token_filters = [Product.name.ilike(f"%{t}%") for t in tokens]
+                    token_desc_filters = [Product.description.ilike(f"%{t}%") for t in tokens]
+                    suggestions = (
+                        db.query(Product)
+                        .filter(or_(*token_filters, *token_desc_filters))
+                        .limit(5)
+                        .all()
+                    )
+            except Exception:
+                suggestions = []
+
+            if suggestions:
+                facts["suggested_items"] = [
+                    {"name": s.name, "price": s.price, "category": s.category, "in_stock": s.quantity_in_stock > 0}
+                    for s in suggestions
+                ]
+
+            # Signal unavailability and request clarification anchored to DB
+            facts.update({
+                "unavailable": True,
+                "strict_db_only": True
+            })
+            return self._clarify(
+                intent="product_info",
+                question="We don't have that exact item. Would you like one of the suggested items, or tell me a specific item from our menu?"
+            )
         finally:
             db.close()
     

@@ -160,6 +160,9 @@ Assistant:"""
                 "  - Subtotal, tax, and total.\n"
                 "  - Fulfillment info and customer details (name, phone, address, time).\n"
                 "- Only after the user says 'confirm' (or clearly confirms), proceed. Otherwise, keep the cart open.\n"
+                "- CRITICAL: Do NOT add items that are not present in the database-provided catalog.\n"
+                "- If the requested item is not found in the database, ask a short clarification and/or offer close in-DB alternatives.\n"
+                "- If the user clearly rejects alternatives, state directly that we don't have that item.\n"
             ),
             "product_info": (
                 "PRODUCT INFO RULES:\n"
@@ -168,6 +171,8 @@ Assistant:"""
                 "- Use inventory status when phrasing: if an item is not in stock, do not oversell; briefly acknowledge it's a nice choice and clearly state it's currently unavailable, then suggest similar in-stock alternatives.\n"
                 "- If the user gives a budget, filter to that range if possible.\n"
                 "- If the user is vague, ask a short clarifying question (e.g., flavor or category).\n"
+                "- CRITICAL: Never invent items, flavors, or prices not found in the database-provided context.\n"
+                "- If no matching DB item exists, respond that we don't have it and ask a DB-anchored clarification.\n"
             ),
             "general_info": (
                 "GENERAL INFO RULES:\n"
