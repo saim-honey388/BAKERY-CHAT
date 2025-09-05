@@ -12,6 +12,33 @@ import requests
 from typing import Dict, List, Any, Optional
 from .config import Config
 import time
+import threading
+
+# Global rate limiter to prevent API spam
+class RateLimiter:
+    def __init__(self, max_calls_per_minute=30):
+        self.max_calls = max_calls_per_minute
+        self.calls = []
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        with self.lock:
+            now = time.time()
+            # Remove calls older than 1 minute
+            self.calls = [call_time for call_time in self.calls if now - call_time < 40]
+            
+            if len(self.calls) >= self.max_calls:
+                # Wait until the oldest call is more than 1 minute old
+                oldest_call = min(self.calls)
+                wait_time = 40 - (now - oldest_call) + 1
+                if wait_time > 0:
+                    print(f"DEBUG: Rate limiter: waiting {wait_time:.1f}s to avoid API limits...")
+                    time.sleep(wait_time)
+            
+            self.calls.append(now)
+
+# Global rate limiter instance
+_gemini_rate_limiter = RateLimiter(max_calls_per_minute=25)  # Conservative limit
 
 class EnhancedAPIClient:
     """Enhanced API Client for context extraction and memory analysis."""
@@ -121,7 +148,7 @@ class EnhancedAPIClient:
     def _format_conversation(self, conversation: List[Dict]) -> str:
         """Format conversation for the prompt."""
         formatted = []
-        for msg in conversation[-10:]:  # Last 10 messages
+        for msg in conversation[-14:]:  # Last 14 messages
             role = msg.get('role', 'unknown')
             message = msg.get('message', '')
             formatted.append(f"{role}: {message}")
@@ -142,27 +169,55 @@ class EnhancedAPIClient:
                     "maxOutputTokens": 1000
                 }
             }
-            try:
-                print("DEBUG: Calling Gemini API for context extraction...")
-                resp = requests.post(self.api_base_url, params=params, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                # Extract text from candidates
-                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                return text
-            except Exception as e:
-                print(f"Enhanced API (Gemini) call failed: {e}. Attempting Gemini fallback model...")
-                # Fallback to Gemini Flash-Lite
+            max_retries = 2  # Fewer retries for Enhanced API
+            base_backoff = 3.0
+            for attempt in range(1, max_retries + 1):
                 try:
-                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{Config.GEMINI_FALLBACK_MODEL}:generateContent"
-                    resp = requests.post(fallback_url, params=params, headers=headers, json=payload, timeout=30)
+                    # Apply rate limiting before making the call
+                    _gemini_rate_limiter.wait_if_needed()
+                    print("DEBUG: Calling Gemini API for context extraction...")
+                    resp = requests.post(self.api_base_url, params=params, headers=headers, json=payload, timeout=30)
+                    
+                    # Handle rate limiting
+                    if resp.status_code == 429:
+                        import random
+                        retry_after = base_backoff * (2 ** (attempt - 1)) + random.uniform(1, 2)
+                        print(f"DEBUG: Enhanced API rate limited (429). Sleeping for {retry_after:.1f}s...")
+                        time.sleep(retry_after)
+                        continue
+                    
+                    # Handle quota exceeded
+                    if resp.status_code == 403:
+                        print(f"DEBUG: Enhanced API quota exceeded (403). Sleeping for 5s...")
+                        time.sleep(5)
+                        continue
+                    
                     resp.raise_for_status()
                     data = resp.json()
+                    # Extract text from candidates
                     text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     return text
-                except Exception as e2:
-                    print(f"Enhanced API Gemini fallback failed: {e2}")
-                    raise e
+                    
+                except Exception as e:
+                    print(f"Enhanced API (Gemini) call failed on attempt {attempt}: {e}")
+                    if attempt < max_retries:
+                        sleep_time = base_backoff * attempt
+                        print(f"DEBUG: Enhanced API backing off for {sleep_time}s...")
+                        time.sleep(sleep_time)
+                    else:
+                        # Fallback to Gemini Flash-Lite
+                        print("DEBUG: Attempting Gemini fallback model...")
+                        try:
+                            _gemini_rate_limiter.wait_if_needed()
+                            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{Config.GEMINI_FALLBACK_MODEL}:generateContent"
+                            resp = requests.post(fallback_url, params=params, headers=headers, json=payload, timeout=30)
+                            resp.raise_for_status()
+                            data = resp.json()
+                            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            return text
+                        except Exception as e2:
+                            print(f"Enhanced API Gemini fallback failed: {e2}")
+                            raise e
         else:
             # Groq-compatible
             headers = {
@@ -266,28 +321,46 @@ class PrimaryAPIClient:
                 }
             }
             max_retries = 3
-            backoff = 2.0
+            base_backoff = 5.0  # Increased base backoff
             last_err = None
             for attempt in range(1, max_retries + 1):
                 try:
+                    # Apply rate limiting before making the call
+                    _gemini_rate_limiter.wait_if_needed()
                     print(f"DEBUG: Calling Primary API for response generation (attempt {attempt})...")
                     resp = requests.post(self.api_base_url, params=params, headers=headers, json=payload, timeout=30)
+                    
+                    # Handle rate limiting with exponential backoff + jitter
                     if resp.status_code == 429:
-                        retry_after = backoff * attempt
-                        print(f"DEBUG: Rate limited. Sleeping for {retry_after}s before retry...")
+                        import random
+                        retry_after = base_backoff * (2 ** (attempt - 1)) + random.uniform(1, 3)
+                        print(f"DEBUG: Rate limited (429). Sleeping for {retry_after:.1f}s before retry...")
                         time.sleep(retry_after)
                         continue
+                    
+                    # Handle quota exceeded
+                    if resp.status_code == 403:
+                        error_data = resp.json() if resp.content else {}
+                        if "quota" in str(error_data).lower() or "limit" in str(error_data).lower():
+                            print(f"DEBUG: Quota exceeded (403). Sleeping for 10s before retry...")
+                            time.sleep(10)
+                            continue
+                    
                     resp.raise_for_status()
                     data = resp.json()
                     text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     print("DEBUG: Primary API response received successfully")
                     return text
+                    
                 except Exception as e:
                     last_err = e
                     print(f"Primary API (Gemini) call failed on attempt {attempt}: {e}")
+                    
+                    # If this is the last attempt, try fallback model
                     if attempt == max_retries:
-                        # Last attempt: try fallback model once
+                        print("DEBUG: Trying fallback model (Gemini Flash-Lite)...")
                         try:
+                            _gemini_rate_limiter.wait_if_needed()
                             fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.fallback_model}:generateContent"
                             resp = requests.post(fallback_url, params=params, headers=headers, json=payload, timeout=30)
                             resp.raise_for_status()
@@ -297,6 +370,15 @@ class PrimaryAPIClient:
                             return text
                         except Exception as e2:
                             print(f"Primary API Gemini fallback failed: {e2}")
+                            # Add delay before final failure
+                            time.sleep(5)
+                    
+                    # Add delay between retries for non-rate-limit errors
+                    if attempt < max_retries:
+                        sleep_time = base_backoff * attempt
+                        print(f"DEBUG: Backing off for {sleep_time}s before retry...")
+                        time.sleep(sleep_time)
+            
             # After retries exhausted
             raise last_err if last_err else RuntimeError("Primary API call failed without exception")
         else:

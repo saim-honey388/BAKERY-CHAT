@@ -118,14 +118,45 @@ class OrderAgent(BaseAgent):
     def _parse_hour_str_to_time(hour_str: str):
         from datetime import time
         import re
-        m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", hour_str.strip(), re.IGNORECASE)
-        if not m:
+        s = (hour_str or "").strip()
+        if not s:
             return None
-        hh = int(m.group(1)) % 12
-        mm = int(m.group(2) or 0)
-        if m.group(3).lower() == 'pm':
-            hh += 12
-        return time(hh, mm)
+        # 12-hour format: 1, 1:30 am/pm
+        m12 = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", s, re.IGNORECASE)
+        if m12:
+            hh = int(m12.group(1)) % 12
+            mm = int(m12.group(2) or 0)
+            if m12.group(3).lower() == 'pm':
+                hh += 12
+            return time(hh, mm)
+        # 24-hour format: 0-23 or 00:00-23:59
+        m24 = re.match(r"^(\d{1,2})(?::(\d{2}))$", s)
+        if m24:
+            hh = int(m24.group(1))
+            mm = int(m24.group(2))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return time(hh, mm)
+        m24h = re.match(r"^(\d{1,2})$", s)
+        if m24h:
+            hh = int(m24h.group(1))
+            if 0 <= hh <= 23:
+                return time(hh, 0)
+        return None
+
+    @staticmethod
+    def _format_time_12h(t) -> str:
+        # Format datetime.time to 'H am/pm' or 'H:MM am/pm'
+        if t is None:
+            return None
+        h = t.hour
+        m = t.minute
+        ampm = 'am' if h < 12 else 'pm'
+        h12 = h % 12
+        if h12 == 0:
+            h12 = 12
+        if m == 0:
+            return f"{h12} {ampm}"
+        return f"{h12}:{m:02d} {ampm}"
 
     @staticmethod
     def _load_locations():
@@ -197,6 +228,24 @@ class OrderAgent(BaseAgent):
         self.carts: Dict[str, OrderAgent.ShoppingCart] = {}  # session_id -> ShoppingCart
         self.last_receipt_by_session: Dict[str, str] = {}  # Store last receipt per session
         self.entity_extractor = EntityExtractor()
+
+    @staticmethod
+    def _is_branch_name(value: str) -> bool:
+        """Return True if the provided value matches a known branch name/prefix."""
+        try:
+            if not value:
+                return False
+            val = str(value).strip().lower()
+            locations = OrderAgent._load_locations()
+            for b in locations:
+                name = (b.get('name') or '').strip().lower()
+                if not name:
+                    continue
+                if val == name or val.startswith(name) or name.startswith(val):
+                    return True
+            return False
+        except Exception:
+            return False
 
     def get_cart_state(self, session_id: str) -> Dict[str, Any]:
         cart = self.carts.get(session_id)
@@ -457,6 +506,12 @@ class OrderAgent(BaseAgent):
         except Exception:
             catalog = []
 
+        # Locations data (branches + hours) for LLM reasoning
+        try:
+            locations = self._load_locations()
+        except Exception:
+            locations = []
+
         unified = {
             "summary": memory_context.get("summary") if isinstance(memory_context, dict) else None,
             "last_10_messages": last_10_messages,
@@ -465,6 +520,7 @@ class OrderAgent(BaseAgent):
             "missing_details": missing,
             "rules": rules,
             "db_catalog": catalog,
+            "locations": locations,
             "weights": {
                 "cart_state": 1.0,
                 "last_10_messages": 0.8,
@@ -638,9 +694,17 @@ class OrderAgent(BaseAgent):
             - Treat SERVER CART as ground truth; never remove items or change quantities unless the USER explicitly asks in THIS turn.
             - Do NOT suggest "clear_cart" or remove items unless the USER explicitly asks.
             - Only add items if the USER explicitly asked for them in THIS turn.
-            - Never set fulfillment to anything other than "pickup" or "delivery".
+            - NEVER set fulfillment_type to anything other than exactly "pickup" or "delivery". 
+            - If user mentions payment method but fulfillment is unclear, ask "Would you like pickup or delivery?"
             - Only set customer fields that the USER provided in THIS turn.
             - NEVER invent items not in db_catalog. If unclear, ask a short, DB-anchored clarification.
+            - For quantity changes: If user says "I want 3 cheesecakes" and cart has 1, use modify_item to set quantity to 3 (not add 3).
+            - Always validate fulfillment_type is exactly "pickup" or "delivery" before proceeding.
+            - When user mentions a specific quantity for an existing item, use modify_item type, not add_item.
+            - TIME/BRANCH FLOW: For pickup orders, you MUST ask for pickup time first, then branch name. When user provides branch name, validate the previously provided time against that branch's hours. If time is outside hours, ask user to choose a time within the branch's open-close window.
+            - TIME VALIDATION: Use context.locations to validate pickup/delivery times against the selected branch hours; if time is outside hours, do NOT set it. Ask the user to choose a time within that branch's open-close window.
+            - NAME PROTECTION: Never set customer name to generic/command/location terms: ["modify","change","edit","update","confirm","confirmation","yes","ok","okay","pickup","pick up","delivery","downtown","branch","location"].
+            - CART AUTHORITY: Treat the provided cart snapshot as authoritative; do not clear or reset it. Propose explicit cart_updates only.
             
             CONVERSATION CONTEXT RULES (CRITICAL):
             - USER_REQUEST messages contain actual user intents - treat these as real requests
@@ -650,6 +714,18 @@ class OrderAgent(BaseAgent):
             - Only act on USER_REQUEST content, ignore BOT_RESPONSE content for user intent
             - Sequence numbers show conversation order - higher numbers are more recent
             - Current user query is the LATEST USER_REQUEST in the sequence
+            
+            - TIME VALIDATION: Use context.locations to validate any provided pickup/delivery time against the selected branch hours; if out-of-hours, do NOT set the time and ask the user to choose a time within the branch window.
+            - NAME PROTECTION: Never set name to generic/command/location terms: ["modify","change","edit","update","confirm","confirmation","yes","ok","okay","pickup","pick up","delivery","downtown","branch","location"].
+            - CART AUTHORITY: Treat the provided cart snapshot as authoritative; do not clear/reset it from memory. Propose explicit cart_updates only.
+            - MODIFY BEHAVIOR: If user says "modify" without specifics, return response_type: "modify_cart" and a short clarification question; when specifics are provided, update only that field and then propose confirmation.
+            
+            ORDER FLOW REQUIREMENTS:
+            1. For pickup orders: Ask for pickup time first, then branch name
+            2. When branch is provided: Validate the pickup time against branch hours
+            3. If time is invalid: Ask user to choose a time within branch hours
+            4. Only proceed to confirmation when all details are complete
+            5. When user says "confirm" after seeing preview: Finalize the order
             
             - Think step-by-step privately. Then respond with ONLY valid JSON (no comments, no prose).
             - Return valid JSON only.
@@ -663,7 +739,10 @@ class OrderAgent(BaseAgent):
             import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
-                return json.loads(json_match.group())
+                result = json.loads(json_match.group())
+                # Validate LLM decisions before returning
+                result = self._validate_llm_decisions(result, cart)
+                return result
             else:
                 return {}
                 
@@ -847,7 +926,7 @@ class OrderAgent(BaseAgent):
                     {{"product": "product_name", "quantity": 1}}
                 ],
                 "modifications": {{
-                    "type": "change_fulfillment/change_customer_info/change_items/change_payment",
+                    "type": "change_fulfillment/change_customer_info/change_items/change_payment/unspecified",
                     "details": "what to change"
                 }}
             }}
@@ -859,6 +938,9 @@ class OrderAgent(BaseAgent):
             - Only set customer fields that the USER provided in THIS turn.
             - NEVER invent items not in db_catalog. If unclear, ask a short, DB-anchored clarification.
             - TIME HANDLING: If the user provides a time and fulfillment is pickup, treat it as pickup_time, NOT a change_fulfillment. Do not modify fulfillment_type from time input.
+            - MODIFICATION HANDLING: If user says "modify", "change", "edit", "update" without specifying what, return action: "modify_cart" with modifications.type: "unspecified"
+            - NAME PROTECTION: Never set customer name to generic words like "modify", "change", "edit", "update" - these are commands, not names
+            - CUSTOMER NAME RULE: Only set customer name if user explicitly provides a real name (not commands, not generic words)
             
             CONVERSATION CONTEXT RULES (CRITICAL):
             - USER_REQUEST messages contain actual user intents - treat these as real requests
@@ -868,6 +950,18 @@ class OrderAgent(BaseAgent):
             - Only act on USER_REQUEST content, ignore BOT_RESPONSE content for user intent
             - Sequence numbers show conversation order - higher numbers are more recent
             - Current user query is the LATEST USER_REQUEST in the sequence
+            
+            - TIME VALIDATION: Use context.locations to validate any provided pickup/delivery time against the selected branch hours; if out-of-hours, do NOT set the time and ask the user to choose a time within the branch window.
+            - NAME PROTECTION: Never set name to generic/command/location terms: ["modify","change","edit","update","confirm","confirmation","yes","ok","okay","pickup","pick up","delivery","downtown","branch","location"].
+            - CART AUTHORITY: Treat the provided cart snapshot as authoritative; do not clear/reset it from memory. Propose explicit cart_updates only.
+            - MODIFY BEHAVIOR: If user says "modify", "change", "edit", "update" without specifying what, return action: "modify_cart" with modifications.type: "unspecified"
+            
+            ORDER FLOW REQUIREMENTS:
+            1. For pickup orders: Ask for pickup time first, then branch name
+            2. When branch is provided: Validate the pickup time against branch hours
+            3. If time is invalid: Ask user to choose a time within branch hours
+            4. Only proceed to confirmation when all details are complete
+            5. When user says "confirm" after seeing preview: Finalize the order
             
             - Think step-by-step privately. Then respond with ONLY valid JSON (no comments, no prose).
             - Return valid JSON only.
@@ -972,7 +1066,7 @@ class OrderAgent(BaseAgent):
         )
         print(f"DEBUG: Customer created or found. Customer ID: {customer.id}")
 
-        # Create order
+        # Create order (start as pending)
         order = Order(
             customer_id=customer.id,
             status=OrderStatus.pending,
@@ -1129,27 +1223,41 @@ class OrderAgent(BaseAgent):
         }
         )
 
-    # --- New: business hour validation ---
     @staticmethod
-    def _parse_hour_str_to_time(hour_str: str):
-        from datetime import time
-        import re
-        m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", hour_str.strip(), re.IGNORECASE)
-        if not m:
-            return None
-        hh = int(m.group(1)) % 12
-        mm = int(m.group(2) or 0)
-        if m.group(3).lower() == 'pm':
-            hh += 12
-        return time(hh, mm)
+    def _normalize_branch_name(value: str) -> str:
+        """Return the canonical branch name from locations.json matching the input, or empty string if none."""
+        try:
+            if not value:
+                return ""
+            val = str(value).strip().lower()
+            locations = OrderAgent._load_locations()
+            # Exact or prefix match
+            for b in locations:
+                name = (b.get('name') or '').strip()
+                if not name:
+                    continue
+                low = name.lower()
+                if val == low or val.startswith(low) or low.startswith(val):
+                    return name
+            return ""
+        except Exception:
+            return ""
 
-    @staticmethod
-    def _load_locations():
-        import json, os
-        path = os.path.join(os.path.dirname(__file__), "..", "data", "raw", "locations.json")
-        path = os.path.abspath(path)
-        with open(path, 'r') as f:
-            return json.load(f)
+    @classmethod
+    def _is_time_str_within_branch_hours(cls, time_str: str, branch_name: str) -> bool:
+        """Validate a time like '3 pm' or '11:30 am' against today's hours for the branch."""
+        from datetime import datetime
+        try:
+            # Parse 12h time
+            t = cls._parse_hour_str_to_time(time_str)
+            if not t:
+                return False
+            # Compare to today's hours for branch
+            now = datetime.now()
+            open_t, close_t = cls._get_branch_hours_for_datetime(branch_name or "", now)
+            return open_t <= t <= close_t
+        except Exception:
+            return False
 
     @classmethod
     def _get_branch_hours_for_datetime(cls, branch_name: str, dt) -> tuple:
@@ -1334,6 +1442,13 @@ class OrderAgent(BaseAgent):
         self.last_receipt_by_session[session_id] = receipt_text
         print(f"DEBUG: Receipt stored for session {session_id}.")
 
+        # Mark order as confirmed now that stock is decremented and items recorded
+        try:
+            order.status = OrderStatus.confirmed
+            print(f"DEBUG: Order status set to confirmed for Order ID: {order.id}")
+        except Exception as e:
+            print(f"DEBUG: Failed to set order status to confirmed: {e}")
+
         # Commit all changes to the database
         db.commit()
 
@@ -1373,16 +1488,18 @@ class OrderAgent(BaseAgent):
             print("No orders found.")
         else:
             for o in orders:
-                print(f"- Order #{o.id}: Customer {o.customer_id}, Status: {o.status.value}, Fulfillment: {o.pickup_or_delivery.value}")
-
-        # Print Order Items
-        order_items = db.query(OrderItem).all()
+                try:
+                    fulfillment = o.pickup_or_delivery.value if hasattr(o, 'pickup_or_delivery') and o.pickup_or_delivery else 'unknown'
+                except Exception:
+                    fulfillment = 'unknown'
+                print(f"- Order #{o.id}: Customer {o.customer_id}, Status: {o.status.value if hasattr(o.status, 'value') else o.status}, Fulfillment: {fulfillment}")
         print("\n[Order Items]")
+        order_items = db.query(OrderItem).all()
         if not order_items:
             print("No order items found.")
         else:
             for oi in order_items:
-                print(f"- Item: {oi.product.name}, Quantity: {oi.quantity}, Order ID: {oi.order_id}")
+                print(f"- {oi.quantity}x {oi.product.name} (Order #{oi.order_id})")
         print("-----------------------\n")
 
     def _find_or_create_customer(self, db: Session, session_id: str = None, name: str = None, phone: str = None) -> Customer:
@@ -1485,14 +1602,20 @@ class OrderAgent(BaseAgent):
                 if (cart.fulfillment_type == 'pickup'):
                     m_time = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", query, re.IGNORECASE)
                     if m_time:
-                        hh = int(m_time.group(1)) % 12
-                        mm = int(m_time.group(2) or 0)
-                        if m_time.group(3).lower() == 'pm':
-                            hh += 12
-                        # store a simple HH:MM 24h string for now
-                        cart.pickup_info['pickup_time'] = f"{hh:02d}:{mm:02d}"
-                        cart.awaiting_details = False
-                        print(f"[CART] Set pickup_time from user query: {cart.pickup_info['pickup_time']}")
+                        # Preserve user-friendly 12-hour format for display
+                        hour_str = str(int(m_time.group(1)))
+                        min_str = (m_time.group(2) or '').strip()
+                        ampm = m_time.group(3).lower()
+                        display = f"{hour_str}:{min_str} {ampm}" if min_str else f"{hour_str} {ampm}"
+                        # Validate against branch hours if branch is known
+                        if cart.branch_name and not self._is_time_str_within_branch_hours(display, cart.branch_name):
+                            print(f"[TIME VALIDATION] Provided pickup time outside hours for {cart.branch_name}: {display}")
+                            # Let the LLM handle the clarification using locations context
+                            cart.expected_field = 'pickup_time'
+                        else:
+                            cart.pickup_info['pickup_time'] = display
+                            cart.awaiting_details = False
+                            print(f"[CART] Set pickup_time from user query: {cart.pickup_info['pickup_time']}")
             except Exception:
                 pass
 
@@ -1512,7 +1635,17 @@ class OrderAgent(BaseAgent):
                         self._add_item_to_cart(cart, prod_name, qty, db)
                     # Customer details
                     if nlu.get("name"):
-                        cart.customer_info['name'] = nlu.get("name")
+                        # Guard: ignore generic modification/confirmation words as names
+                        proposed_name = str(nlu.get("name")).strip()
+                        if proposed_name.lower() in {"modify", "change", "edit", "update", "confirm", "confirmation", "yes", "ok", "okay"}:
+                            print("[NLU FALLBACK] Ignoring generic modify word as customer name")
+                        elif self._is_branch_name(proposed_name):
+                            normalized_branch = self._normalize_branch_name(proposed_name)
+                            if normalized_branch:
+                                cart.branch_name = normalized_branch
+                                print(f"[NLU FALLBACK] Interpreted 'name' as branch; set branch_name: {cart.branch_name}")
+                        else:
+                            cart.customer_info['name'] = proposed_name
                     if nlu.get("phone_number"):
                         cart.customer_info['phone_number'] = nlu.get("phone_number")
                     pm = (nlu.get("payment_method") or '').lower()
@@ -1525,18 +1658,27 @@ class OrderAgent(BaseAgent):
                         cart.awaiting_fulfillment = False
                     # Times and addresses
                     if nlu.get("pickup_time"):
-                        cart.pickup_info['pickup_time'] = nlu.get("pickup_time")
+                        pick = str(nlu.get("pickup_time")).strip()
+                        if cart.branch_name and not self._is_time_str_within_branch_hours(pick, cart.branch_name):
+                            print(f"[NLU FALLBACK] Ignoring pickup time outside hours for {cart.branch_name}: {pick}")
+                            cart.expected_field = 'pickup_time'
+                        else:
+                            cart.pickup_info['pickup_time'] = pick
                     if nlu.get("address"):
                         cart.delivery_info['address'] = nlu.get("address")
                     if nlu.get("delivery_time"):
                         cart.delivery_info['delivery_time'] = nlu.get("delivery_time")
                     # Branch
                     if nlu.get("branch"):
-                        cart.branch_name = nlu.get("branch")
-                        print(f"[NLU FALLBACK] Set branch_name from 'branch': {cart.branch_name}")
+                        normalized = self._normalize_branch_name(nlu.get("branch"))
+                        if normalized:
+                            cart.branch_name = normalized
+                            print(f"[NLU FALLBACK] Set branch_name from 'branch': {cart.branch_name}")
                     elif nlu.get("location"):  # Also check for location as branch
-                        cart.branch_name = nlu.get("location")
-                        print(f"[NLU FALLBACK] Set branch_name from 'location': {cart.branch_name}")
+                        normalized = self._normalize_branch_name(nlu.get("location"))
+                        if normalized:
+                            cart.branch_name = normalized
+                            print(f"[NLU FALLBACK] Set branch_name from 'location': {cart.branch_name}")
             except Exception as e:
                 print(f"[NLU FALLBACK] Failed to apply entity-based add-to-cart: {e}")
 
@@ -1566,6 +1708,9 @@ class OrderAgent(BaseAgent):
                     elif update["type"] == "remove_item":
                         print(f"[CART UPDATE] Removing {update['product']} from cart")
                         self._remove_item_from_cart(cart, update["product"])
+                    elif update["type"] == "modify_item":
+                        print(f"[CART UPDATE] Modifying item: {update['product']} to quantity {update['quantity']}")
+                        self._modify_item_quantity(cart, update["product"], update["quantity"], db)
                     elif update["type"] == "update_customer_info":
                         info = update.get("info") or {}
                         print(f"[CART UPDATE] Normalizing customer info: {info}")
@@ -1576,7 +1721,18 @@ class OrderAgent(BaseAgent):
                             info = {k: v}
                         # Map fields to correct structures
                         if 'name' in info:
-                            cart.customer_info['name'] = info['name']
+                            # Guard against generic/command/location terms being treated as a name
+                            proposed_name = str(info['name']).strip()
+                            forbidden_names = {"modify","change","edit","update","confirm","confirmation","yes","ok","okay","pickup","pick up","delivery","downtown","branch","location"}
+                            if proposed_name.lower() in forbidden_names:
+                                print("[CART UPDATE] Ignoring invalid name value from LLM: generic/command/location term")
+                                return self._llm_clarify_next_step("What would you like to modify? (name, phone, items, fulfillment, payment)", cart, memory_context, db)
+                            # Guard: avoid misclassifying branch names as customer names
+                            if self._is_branch_name(proposed_name):
+                                print("[CART UPDATE] Detected branch-like value for name; treating as branch selection instead")
+                                cart.branch_name = proposed_name
+                            else:
+                                cart.customer_info['name'] = proposed_name
                         if 'phone' in info:
                             cart.customer_info['phone_number'] = info['phone']
                         if 'phone_number' in info:
@@ -1594,22 +1750,63 @@ class OrderAgent(BaseAgent):
                         if 'delivery_time' in info:
                             cart.delivery_info['delivery_time'] = info['delivery_time']
                         if 'pickup_time' in info:
-                            cart.pickup_info['pickup_time'] = info['pickup_time']
+                            # Normalize/validate pickup time; accept 12h or 24h, store user-friendly 12h
+                            raw = str(info['pickup_time']).strip()
+                            parsed = self._parse_hour_str_to_time(raw)
+                            if not parsed:
+                                print(f"[CART UPDATE] Invalid pickup_time format: {raw}")
+                                cart.expected_field = 'pickup_time'
+                                return self._llm_clarify_next_step("Please provide a valid pickup time (e.g., 5 pm).", cart, memory_context, db)
+                            # Validate against branch hours when branch known
+                            if cart.branch_name and not self._is_time_within_business_hours(datetime.datetime.combine(datetime.date.today(), parsed).isoformat(), cart.branch_name):
+                                print(f"[CART UPDATE] Pickup time outside branch hours for {cart.branch_name}: {raw}")
+                                open_t, close_t = self._get_branch_hours_for_datetime(cart.branch_name, datetime.datetime.now())
+                                cart.expected_field = 'pickup_time'
+                                return self._llm_clarify_next_step(
+                                    f"The {cart.branch_name} branch is open {open_t.strftime('%-I:%M %p')}–{close_t.strftime('%-I:%M %p')}. Please choose a time within those hours.",
+                                    cart, memory_context, db)
+                            cart.pickup_info['pickup_time'] = self._format_time_12h(parsed)
+                            cart.awaiting_details = False
                         if 'branch' in info:
-                            cart.branch_name = info['branch']
-                            print(f"[CART UPDATE] Set branch_name: {cart.branch_name}")
+                            # Normalize branch to canonical name from locations.json
+                            normalized = self._normalize_branch_name(info['branch'])
+                            if normalized:
+                                cart.branch_name = normalized
+                                print(f"[CART UPDATE] Set branch_name: {cart.branch_name}")
+                            else:
+                                print(f"[CART UPDATE] Invalid branch provided: {info['branch']}")
+                                return self._llm_clarify_next_step("Please choose a valid branch (Downtown, Westside, Mall)", cart, memory_context, db)
                     elif update["type"] == "set_fulfillment":
                         # Support LLM using set_fulfillment to set time/branch; normalize
                         info = update.get("info") or {}
                         if 'pickup_time' in info:
-                            cart.pickup_info['pickup_time'] = info['pickup_time']
+                            raw = str(info['pickup_time']).strip()
+                            parsed = self._parse_hour_str_to_time(raw)
+                            if not parsed:
+                                print(f"[CART UPDATE] Invalid pickup_time format in set_fulfillment: {raw}")
+                                cart.expected_field = 'pickup_time'
+                                return self._llm_clarify_next_step("Please provide a valid pickup time (e.g., 5 pm).", cart, memory_context, db)
+                            if cart.branch_name and not self._is_time_within_business_hours(datetime.datetime.combine(datetime.date.today(), parsed).isoformat(), cart.branch_name):
+                                print(f"[CART UPDATE] Pickup time outside branch hours in set_fulfillment for {cart.branch_name}: {raw}")
+                                open_t, close_t = self._get_branch_hours_for_datetime(cart.branch_name, datetime.datetime.now())
+                                cart.expected_field = 'pickup_time'
+                                return self._llm_clarify_next_step(
+                                    f"The {cart.branch_name} branch is open {open_t.strftime('%-I:%M %p')}–{close_t.strftime('%-I:%M %p')}. Please choose a time within those hours.",
+                                    cart, memory_context, db)
+                            cart.pickup_info['pickup_time'] = self._format_time_12h(parsed)
+                            cart.awaiting_details = False
                             print(f"[CART UPDATE] Set pickup_time: {cart.pickup_info['pickup_time']}")
                         if 'delivery_time' in info:
                             cart.delivery_info['delivery_time'] = info['delivery_time']
                             print(f"[CART UPDATE] Set delivery_time: {cart.delivery_info['delivery_time']}")
                         if 'branch' in info:
-                            cart.branch_name = info['branch']
-                            print(f"[CART UPDATE] Set branch: {cart.branch_name}")
+                            normalized = self._normalize_branch_name(info['branch'])
+                            if normalized:
+                                cart.branch_name = normalized
+                                print(f"[CART UPDATE] Set branch: {cart.branch_name}")
+                            else:
+                                print(f"[CART UPDATE] Invalid branch provided in set_fulfillment: {info['branch']}")
+                                return self._llm_clarify_next_step("Please choose a valid branch (Downtown, Westside, Mall)", cart, memory_context, db)
                         ft = (update.get("fulfillment_type") or '').lower()
                         if ft in ('pickup','delivery'):
                             print(f"[CART UPDATE] Setting fulfillment type: {ft}")
@@ -1645,11 +1842,12 @@ class OrderAgent(BaseAgent):
                         memory_context,
                         db,
                     )
-                # If we are awaiting confirmation and nothing is missing, always show preview receipt now
-                if cart.awaiting_confirmation and not self._get_missing_details(cart):
+                # If details are complete, always show preview receipt immediately
+                if not self._get_missing_details(cart):
                     print("[CONFIRMATION] Details complete and awaiting confirmation - showing preview receipt")
                     preview_receipt = self._build_preview_receipt(cart)
                     cart.last_prompt = "preview_receipt"
+                    cart.awaiting_confirmation = True
                     return self._ok(
                         "order",
                         "Here is your order summary. Please review and confirm:",
@@ -1661,6 +1859,63 @@ class OrderAgent(BaseAgent):
                     )
             else:
                 print("[CART STATE] No cart state updates from LLM")
+
+            # Define Phase 1 outputs before trust check to avoid unbound variables
+            phase1_response_type = (order_action.get("response_type") or "").lower()
+            phase1_message = order_action.get("message") or ""
+
+            # Trust the LLM's response - only use missing details logic as fallback
+            # If LLM provided a good response, use it instead of overriding with generic messages
+            if phase1_message and phase1_message.strip() and not phase1_message.startswith("Collect missing"):
+                print("[LLM TRUST] Using LLM's response instead of missing details logic")
+                return self._ok("order", phase1_message, {"in_order_context": True})
+            
+            # Only use missing details logic if LLM didn't provide a good response
+            try:
+                pending_missing = self._get_missing_details(cart)
+            except Exception:
+                pending_missing = []
+            if pending_missing:
+                cart.awaiting_details = True
+                cart.expected_field = pending_missing[0]
+                # If we specifically need pickup_time and branch is known, include branch hours
+                if 'pickup_time' in pending_missing and cart.branch_name:
+                    open_t, close_t = self._get_branch_hours_for_datetime(cart.branch_name, datetime.datetime.now())
+                    return self._llm_clarify_next_step(
+                        f"The {cart.branch_name} branch is open {open_t.strftime('%-I:%M %p')}–{close_t.strftime('%-I:%M %p')}. Please choose a time within those hours.",
+                        cart,
+                        memory_context,
+                        db,
+                    )
+                # Generic missing details clarification
+                return self._llm_clarify_next_step(
+                    f"Collect missing: {', '.join(pending_missing)}.",
+                    cart,
+                    memory_context,
+                    db,
+                )
+
+            # Handle confirmation when awaiting confirmation
+            if cart.awaiting_confirmation and self._is_strong_confirmation(query):
+                print("[CONFIRMATION] User confirmed while awaiting confirmation - finalizing order")
+                cart.awaiting_confirmation = False
+                return self._finalize_order(db, cart, session_id, memory_context)
+
+            # Phase 1 short-circuit: if Phase 1 produced actionable output, use it and skip Phase 2
+            phase1_response_type = (order_action.get("response_type") or "").lower()
+            phase1_message = order_action.get("message") or ""
+            actionable_types = {"ask_details", "confirm_order", "modify_cart", "show_receipt", "upsell"}
+            has_updates = bool(order_action.get("cart_updates"))
+            has_actionable = has_updates or (phase1_response_type in actionable_types)
+            if has_actionable:
+                print(f"[SHORT-CIRCUIT] Using Phase 1 output response_type={phase1_response_type}, has_updates={has_updates}")
+                facts = {"in_order_context": True}
+                if phase1_response_type == "confirm_order" and not self._get_missing_details(cart):
+                    preview_receipt = self._build_preview_receipt(cart)
+                    cart.awaiting_confirmation = True
+                    facts.update({"preview_receipt_text": preview_receipt, "awaiting_confirmation": True})
+                # Trust the LLM's message completely - don't override it
+                return self._ok("order", phase1_message, facts)
 
             # NEW: Let LLM handle ALL order flow decisions instead of hardcoded patterns
             print("\n[LLM PHASE 2] Order flow analysis with Enhanced API...")
@@ -1776,17 +2031,18 @@ class OrderAgent(BaseAgent):
                         memory_context,
                         db,
                     )
-                # Require strong user confirmation to finalize
-                if cart.awaiting_confirmation and self._is_strong_confirmation(query):
-                    print("[CONFIRMATION] Strong confirmation detected - finalizing order")
+                # If user gave strong confirmation and details are complete, finalize immediately
+                if self._is_strong_confirmation(query):
+                    print("[CONFIRMATION] Strong confirmation detected (no preview required on this turn) - finalizing order")
                     cart.last_prompt = "confirm_order"
                     return self._finalize_order(db, cart, session_id, memory_context)
-                # Otherwise, show preview receipt again and ask to confirm
-                print("[CONFIRMATION] Not a strong confirmation - showing preview receipt and asking to confirm")
+                # Otherwise, show preview receipt and set awaiting_confirmation for next turn
+                print("[CONFIRMATION] Showing preview receipt and setting awaiting_confirmation for explicit confirm")
                 preview_receipt = self._build_preview_receipt(cart)
+                cart.awaiting_confirmation = True
                 return self._ok(
                     "order",
-                    "Here is your order summary again. Please say 'confirm' to place the order:",
+                    "Here is your order summary. Please say 'confirm' to place the order:",
                     {
                         "in_order_context": True,
                         "preview_receipt_text": preview_receipt,
@@ -1807,12 +2063,16 @@ class OrderAgent(BaseAgent):
                 modifications = order_flow_decision.get("modifications", {})
                 mod_type = modifications.get("type")
                 
-                if mod_type == "change_fulfillment":
+                if mod_type == "unspecified":
+                    # User said "modify" without specifying what - ask for clarification
+                    return self._llm_clarify_next_step("What would you like to modify? (items, fulfillment, customer info, payment)", cart, memory_context, db)
+                elif mod_type == "change_fulfillment":
                     cart.awaiting_fulfillment = True
                     return self._llm_clarify_next_step("What would you like to change about fulfillment? (pickup/delivery, time, address, etc.)", cart, memory_context, db)
                 elif mod_type == "change_customer_info":
                     cart.awaiting_details = True
-                    return self._llm_clarify_next_step("What customer information would you like to change? (name, phone, etc.)", cart, memory_context, db)
+                    # Ask which specific field to modify to avoid overwriting with generic words
+                    return self._llm_clarify_next_step("Which customer info should I update? (name, phone)", cart, memory_context, db)
                 elif mod_type == "change_items":
                     cart.awaiting_details = True
                     return self._llm_clarify_next_step("What items would you like to change? (add, remove, modify quantities)", cart, memory_context, db)
@@ -1820,7 +2080,8 @@ class OrderAgent(BaseAgent):
                     cart.awaiting_details = True
                     return self._llm_clarify_next_step("What payment method would you like to use? (cash, card, upi)", cart, memory_context, db)
                 else:
-                    return self._llm_clarify_next_step("What would you like to modify in your order?", cart, memory_context, db)
+                    # Generic 'modify' command: ask what exactly to change
+                    return self._llm_clarify_next_step("What would you like to modify? (items, fulfillment, customer info, payment)", cart, memory_context, db)
             
             # If LLM didn't provide a clear action, delegate clarification to LLM
             print("[LLM] No clear action from LLM; delegating clarification to LLM")
@@ -1879,6 +2140,57 @@ class OrderAgent(BaseAgent):
             clarification_question=question
         )
 
+    def _modify_item_quantity(self, cart: ShoppingCart, product_name: str, new_quantity: int, db: Session):
+        """Modify the quantity of an existing item in the cart."""
+        try:
+            # Find the product in the cart
+            for i, item in enumerate(cart.items):
+                if item['product'].name.lower() == product_name.lower():
+                    # Validate new quantity
+                    if new_quantity <= 0:
+                        print(f"[MODIFY ITEM] Removing {product_name} (quantity set to {new_quantity})")
+                        cart.remove_item(item['product'])
+                    else:
+                        # Check stock availability
+                        product = db.query(Product).filter(Product.name.ilike(f"%{product_name}%")).first()
+                        if product and product.quantity_in_stock >= new_quantity:
+                            print(f"[MODIFY ITEM] Updating {product_name} quantity from {item['quantity']} to {new_quantity}")
+                            cart.items[i]['quantity'] = new_quantity
+                            cart.calculate_total()
+                        else:
+                            print(f"[MODIFY ITEM] Insufficient stock for {product_name}. Available: {product.quantity_in_stock if product else 0}, Requested: {new_quantity}")
+                    return
+            print(f"[MODIFY ITEM] Product {product_name} not found in cart")
+        except Exception as e:
+            print(f"[MODIFY ITEM] Error modifying item quantity: {e}")
+
+    def _validate_llm_decisions(self, llm_result: Dict, cart: ShoppingCart) -> Dict:
+        """Validate and sanitize LLM decisions before applying to cart."""
+        print(f"[LLM VALIDATION] Validating LLM decisions...")
+        
+        # Validate fulfillment_type
+        if 'cart_updates' in llm_result:
+            for update in llm_result['cart_updates']:
+                if update.get('type') == 'set_fulfillment':
+                    fulfillment_type = update.get('fulfillment_type', '')
+                    if fulfillment_type not in ['pickup', 'delivery']:
+                        print(f"[LLM VALIDATION] Invalid fulfillment_type: {fulfillment_type}, removing update")
+                        llm_result['cart_updates'].remove(update)
+                        # Set response to ask for clarification
+                        llm_result['response_type'] = 'ask_details'
+                        llm_result['message'] = 'Would you like pickup or delivery?'
+        
+        # Validate cart_state
+        if 'cart_state' in llm_result:
+            cart_state = llm_result['cart_state']
+            # Ensure boolean values
+            for key in ['awaiting_details', 'awaiting_confirmation', 'awaiting_fulfillment']:
+                if key in cart_state:
+                    cart_state[key] = bool(cart_state[key])
+        
+        print(f"[LLM VALIDATION] Validation complete")
+        return llm_result
+
     def _get_missing_details(self, cart) -> List[str]:
         """Helper method to get list of missing required details."""
         print(f"\n[MISSING DETAILS CHECK] Analyzing cart for missing information...")
@@ -1900,14 +2212,27 @@ class OrderAgent(BaseAgent):
             print("[MISSING DETAILS CHECK] Missing customer name")
             missing_details.append('name')
             
-        # PRIORITY 2: Fulfillment-specific details
+        # PRIORITY 1.5: Phone number (required for all orders)
+        if not cart.customer_info.get('phone_number'):
+            print("[MISSING DETAILS CHECK] Missing phone number")
+            missing_details.append('phone_number')
+            
+        # PRIORITY 2: Fulfillment type (must be set before other fulfillment details)
+        if not cart.fulfillment_type or cart.fulfillment_type not in ['pickup', 'delivery']:
+            print("[MISSING DETAILS CHECK] Missing or invalid fulfillment type")
+            missing_details.append('fulfillment_type')
+            return missing_details  # Don't check other details until fulfillment is set
+            
+        # PRIORITY 3: Fulfillment-specific details
         if cart.fulfillment_type == 'pickup':
-            if not cart.customer_info.get('phone_number'):
-                print("[MISSING DETAILS CHECK] Missing phone number for pickup")
-                missing_details.append('phone_number')
-            if not cart.pickup_info.get('pickup_time'):
-                print("[MISSING DETAILS CHECK] Missing pickup time")
-                missing_details.append('pickup_time')
+            # Ask for branch before time; if branch not set, defer pickup_time
+            if not cart.branch_name:
+                print("[MISSING DETAILS CHECK] Branch not set, deferring pickup_time until branch chosen")
+                # Don't add pickup_time to missing if branch is not set yet
+            else:
+                if not cart.pickup_info.get('pickup_time'):
+                    print("[MISSING DETAILS CHECK] Missing pickup time (post-branch)")
+                    missing_details.append('pickup_time')
         elif cart.fulfillment_type == 'delivery':
             if not cart.delivery_info.get('address'):
                 print("[MISSING DETAILS CHECK] Missing delivery address")
@@ -1921,20 +2246,16 @@ class OrderAgent(BaseAgent):
             print("[MISSING DETAILS CHECK] Missing payment method")
             missing_details.append('payment_method')
             
-        # PRIORITY 4: Branch selection (only if other details are complete)
-        # Only ask for branch if we have all other essential details
-        if (cart.customer_info.get('name') and 
-            cart.payment_method and
-            ((cart.fulfillment_type == 'pickup' and cart.customer_info.get('phone_number') and cart.pickup_info.get('pickup_time')) or
-             (cart.fulfillment_type == 'delivery' and cart.delivery_info.get('address') and cart.delivery_info.get('delivery_time')))):
-            
+        # PRIORITY 4: Branch selection (for pickup orders, ask for branch before validating time)
+        if cart.fulfillment_type == 'pickup':
             if not cart.branch_name:
-                print("[MISSING DETAILS CHECK] Missing branch selection (all other details complete)")
+                print("[MISSING DETAILS CHECK] Missing branch selection for pickup")
                 missing_details.append('branch')
             else:
-                print("[MISSING DETAILS CHECK] Branch already selected, all details complete!")
-        else:
-            print("[MISSING DETAILS CHECK] Branch selection deferred - other essential details missing")
+                print("[MISSING DETAILS CHECK] Branch selected, can validate pickup time")
+        elif cart.fulfillment_type == 'delivery':
+            # For delivery, branch is not required
+            print("[MISSING DETAILS CHECK] Delivery order - no branch selection needed")
         
         print(f"[MISSING DETAILS CHECK] Final missing details: {missing_details}")
         return missing_details
