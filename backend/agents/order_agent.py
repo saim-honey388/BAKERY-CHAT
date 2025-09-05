@@ -118,29 +118,40 @@ class OrderAgent(BaseAgent):
     def _parse_hour_str_to_time(hour_str: str):
         from datetime import time
         import re
-        s = (hour_str or "").strip()
+        s = (hour_str or "").strip().lower()
         if not s:
             return None
-        # 12-hour format: 1, 1:30 am/pm
+        # normalize internal whitespace
+        s = re.sub(r"\s+", " ", s)
+
+        # 12-hour format: e.g., "1 pm", "1:30pm"
         m12 = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", s, re.IGNORECASE)
         if m12:
             hh = int(m12.group(1)) % 12
             mm = int(m12.group(2) or 0)
-            if m12.group(3).lower() == 'pm':
+            if m12.group(3).lower() == "pm":
                 hh += 12
-            return time(hh, mm)
-        # 24-hour format: 0-23 or 00:00-23:59
-        m24 = re.match(r"^(\d{1,2})(?::(\d{2}))$", s)
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return time(hh, mm)
+            return None
+
+        # 24-hour format with minutes: e.g., "05:00", "23:59"
+        m24 = re.match(r"^(\d{1,2}):(\d{2})$", s)
         if m24:
             hh = int(m24.group(1))
             mm = int(m24.group(2))
             if 0 <= hh <= 23 and 0 <= mm <= 59:
                 return time(hh, mm)
+            return None
+
+        # 24-hour format hour-only: e.g., "5", "17"
         m24h = re.match(r"^(\d{1,2})$", s)
         if m24h:
             hh = int(m24h.group(1))
             if 0 <= hh <= 23:
                 return time(hh, 0)
+            return None
+
         return None
 
     @staticmethod
@@ -722,10 +733,11 @@ class OrderAgent(BaseAgent):
             
             ORDER FLOW REQUIREMENTS:
             1. For pickup orders: Ask for pickup time first, then branch name
-            2. When branch is provided: Validate the pickup time against branch hours
-            3. If time is invalid: Ask user to choose a time within branch hours
-            4. Only proceed to confirmation when all details are complete
-            5. When user says "confirm" after seeing preview: Finalize the order
+            2. When branch is provided: Validate the pickup time against that branch's hours from context.locations
+            3. If time is invalid/outside hours: Do NOT set the time; ask the user to choose a time within that branch's open-close window and include those hours in your message
+            4. If the user then provides a valid time within hours: update the time in cart_updates and remove it from missing details
+            5. Only proceed to confirmation when all details are complete
+            6. When user says "confirm" after seeing preview: Finalize the order
             
             - Think step-by-step privately. Then respond with ONLY valid JSON (no comments, no prose).
             - Return valid JSON only.
@@ -1011,6 +1023,8 @@ class OrderAgent(BaseAgent):
             - Allowed fields: {allowed_fields}.
             - If an expected field is provided, ask ONLY for that field.
             - If fulfillment is not set, ask: pickup or delivery?
+            - If fulfillment is pickup and branch is known, and pickup time provided is outside branch hours, you MUST ask the user to choose a time within that branch's hours. Include the open and close times.
+            - If fulfillment is pickup and branch is unknown, do NOT ask for pickup_time yet; ask for branch first.
             - Do not ask for email.
             Context:
             - Cart: {cart_items_text}
@@ -1023,7 +1037,7 @@ class OrderAgent(BaseAgent):
             - Missing details: {missing}
             - Memory: {memory_context if memory_context else 'None'}
             - User: {query}
-            Respond with at most two to three short sentences: an optional friendly acknowledgement and then ONE direct question for the expected/missing field using "you".If any detail is missing, you must ask for it in the second sentence. If the user has already provided the detail, you should thank them and ask for the next detail.
+            Respond with at most two to three short sentences: an optional friendly acknowledgement and then ONE direct question for the expected/missing field using "you". If any detail is missing, you must ask for it in the second sentence. If the user has already provided the detail, you should thank them and ask for the next detail. If the provided pickup time is outside the branch hours, clearly state the hours and ask the user to pick a time within that window.
             """
             dual_api = DualAPISystem()
             msg = (dual_api.generate_response_with_primary_api(prompt) or "Could you clarify what you'd like to do with your order?").strip()
@@ -1828,6 +1842,13 @@ class OrderAgent(BaseAgent):
                 cart.awaiting_confirmation = order_action["cart_state"].get("awaiting_confirmation", False)
                 cart.awaiting_fulfillment = order_action["cart_state"].get("awaiting_fulfillment", True)
                 print(f"[CART STATE] Updated cart flags: awaiting_details={cart.awaiting_details}, awaiting_confirmation={cart.awaiting_confirmation}, awaiting_fulfillment={cart.awaiting_fulfillment}")
+                
+                # IMMEDIATE FINALIZATION: If LLM set awaiting_confirmation=False, finalize now
+                if not cart.awaiting_confirmation and order_action.get("response_type") == "confirm_order":
+                    print("[CART STATE] LLM set awaiting_confirmation=False with confirm_order - finalizing immediately")
+                    cart.last_prompt = "confirm_order"
+                    return self._finalize_order(db, cart, session_id, memory_context)
+                
                 # Server-side guard: do not allow awaiting_confirmation unless details complete
                 missing_for_confirmation = self._get_missing_details(cart)
                 if cart.awaiting_confirmation and (missing_for_confirmation or not cart.fulfillment_type):
@@ -1864,8 +1885,15 @@ class OrderAgent(BaseAgent):
             phase1_response_type = (order_action.get("response_type") or "").lower()
             phase1_message = order_action.get("message") or ""
 
-            # Trust the LLM's response - only use missing details logic as fallback
-            # If LLM provided a good response, use it instead of overriding with generic messages
+            # Trust the LLM's response - prioritize finalize when it says confirm_order and details are complete
+            missing_for_confirmation = self._get_missing_details(cart)
+            if phase1_response_type == "confirm_order" and not missing_for_confirmation and cart.fulfillment_type:
+                print("[LLM TRUST] LLM requested confirm_order and details complete - finalizing now")
+                cart.awaiting_confirmation = False
+                cart.last_prompt = "confirm_order"
+                return self._finalize_order(db, cart, session_id, memory_context)
+
+            # If LLM provided a good message and it's not a confirm_order case, use it instead of generic messages
             if phase1_message and phase1_message.strip() and not phase1_message.startswith("Collect missing"):
                 print("[LLM TRUST] Using LLM's response instead of missing details logic")
                 return self._ok("order", phase1_message, {"in_order_context": True})
@@ -1910,10 +1938,18 @@ class OrderAgent(BaseAgent):
             if has_actionable:
                 print(f"[SHORT-CIRCUIT] Using Phase 1 output response_type={phase1_response_type}, has_updates={has_updates}")
                 facts = {"in_order_context": True}
-                if phase1_response_type == "confirm_order" and not self._get_missing_details(cart):
-                    preview_receipt = self._build_preview_receipt(cart)
-                    cart.awaiting_confirmation = True
-                    facts.update({"preview_receipt_text": preview_receipt, "awaiting_confirmation": True})
+                # If LLM said confirm_order, check if it also set awaiting_confirmation to False
+                if phase1_response_type == "confirm_order":
+                    # If LLM set awaiting_confirmation to False, it means finalize now
+                    if not cart.awaiting_confirmation:
+                        print("[SHORT-CIRCUIT] LLM set awaiting_confirmation=False, finalizing immediately")
+                        cart.last_prompt = "confirm_order"
+                        return self._finalize_order(db, cart, session_id, memory_context)
+                    else:
+                        # LLM wants to show preview first, then await explicit confirm
+                        preview_receipt = self._build_preview_receipt(cart)
+                        cart.awaiting_confirmation = True
+                        facts.update({"preview_receipt_text": preview_receipt, "awaiting_confirmation": True})
                 # Trust the LLM's message completely - don't override it
                 return self._ok("order", phase1_message, facts)
 
@@ -2067,18 +2103,18 @@ class OrderAgent(BaseAgent):
                     # User said "modify" without specifying what - ask for clarification
                     return self._llm_clarify_next_step("What would you like to modify? (items, fulfillment, customer info, payment)", cart, memory_context, db)
                 elif mod_type == "change_fulfillment":
-                    cart.awaiting_fulfillment = True
-                    return self._llm_clarify_next_step("What would you like to change about fulfillment? (pickup/delivery, time, address, etc.)", cart, memory_context, db)
+                        cart.awaiting_fulfillment = True
+                        return self._llm_clarify_next_step("What would you like to change about fulfillment? (pickup/delivery, time, address, etc.)", cart, memory_context, db)
                 elif mod_type == "change_customer_info":
-                    cart.awaiting_details = True
-                    # Ask which specific field to modify to avoid overwriting with generic words
-                    return self._llm_clarify_next_step("Which customer info should I update? (name, phone)", cart, memory_context, db)
+                        cart.awaiting_details = True
+                        # Ask which specific field to modify to avoid overwriting with generic words
+                        return self._llm_clarify_next_step("Which customer info should I update? (name, phone)", cart, memory_context, db)
                 elif mod_type == "change_items":
-                    cart.awaiting_details = True
-                    return self._llm_clarify_next_step("What items would you like to change? (add, remove, modify quantities)", cart, memory_context, db)
+                        cart.awaiting_details = True
+                        return self._llm_clarify_next_step("What items would you like to change? (add, remove, modify quantities)", cart, memory_context, db)
                 elif mod_type == "change_payment":
-                    cart.awaiting_details = True
-                    return self._llm_clarify_next_step("What payment method would you like to use? (cash, card, upi)", cart, memory_context, db)
+                        cart.awaiting_details = True
+                        return self._llm_clarify_next_step("What payment method would you like to use? (cash, card, upi)", cart, memory_context, db)
                 else:
                     # Generic 'modify' command: ask what exactly to change
                     return self._llm_clarify_next_step("What would you like to modify? (items, fulfillment, customer info, payment)", cart, memory_context, db)
