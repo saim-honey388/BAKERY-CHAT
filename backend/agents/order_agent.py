@@ -1420,6 +1420,17 @@ class OrderAgent(BaseAgent):
             product = item['product']
             print(f"DEBUG: Before decrement - {product.name}: {product.quantity_in_stock} in stock")
             
+            # Get the product from the current session to ensure SQLAlchemy tracks changes
+            print(f"DEBUG: Before query - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: Before query - Product object in session: {product in db}")
+            print(f"DEBUG: Before query - Product ID: {product.id}")
+            
+            # Query the product from the current session instead of merging
+            product = db.query(Product).filter(Product.id == product.id).first()
+            print(f"DEBUG: After query - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: After query - Product object in session: {product in db}")
+            print(f"DEBUG: After query - Product ID: {product.id}")
+            
             order_item = OrderItem(
                 order_id=order.id,
                 product_id=product.id,
@@ -1432,8 +1443,8 @@ class OrderAgent(BaseAgent):
             old_stock = product.quantity_in_stock
             product.quantity_in_stock -= item['quantity']
             print(f"DEBUG: Stock decrement - {product.name}: {old_stock} -> {product.quantity_in_stock}")
-            print(f"DEBUG: Product object dirty: {product in db.dirty}")
-            print(f"DEBUG: Product object in session: {product in db}")
+            print(f"DEBUG: After decrement - Product object dirty: {product in db.dirty}")
+            print(f"DEBUG: After decrement - Product object in session: {product in db}")
             
             print(f"DEBUG: Order item created for product {product.name}. Remaining stock: {product.quantity_in_stock}")
 
