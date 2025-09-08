@@ -21,11 +21,11 @@ Each module in the `app/` directory serves a specific function in the RAG pipeli
 1. **config.py** - Configuration management
 2. **preprocess.py** - Text preprocessing and intent detection
 3. **session.py** - Conversation session management with Redis
-4. **embed.py** - Text embedding generation with Groq API
+4. **embed.py** - Text embedding generation (Gemini‑first via Dual API System)
 5. **retrieval.py** - Hybrid document retrieval (FAISS + BM25)
 6. **rerank.py** - Document relevance reranking
 7. **prompt_builder.py** - LLM prompt construction
-8. **generate.py** - Response generation with Groq LLM
+8. **generate.py** - Response generation (Gemini‑first via Dual API System)
 9. **postprocess.py** - Response formatting and citation management
 10. **main.py** - FastAPI application orchestration
 
@@ -38,7 +38,7 @@ Each module in the `app/` directory serves a specific function in the RAG pipeli
 
 2. Set up environment variables in `.env`:
    ```bash
-   GROQ_API_KEY=your_groq_api_key
+   GEMINI_API_KEY=your_gemini_api_key
    REDIS_HOST=localhost
    REDIS_PORT=6379
    ```

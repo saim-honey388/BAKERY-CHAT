@@ -25,6 +25,69 @@ backend/
 - `order_agent.py`        : Manages order flow, cart, slot filling, upsells, business logic, DB
 - `meta_agent.py`         : Handles meta/system queries ("who are you?")
 
+#### Agent Deep Dive
+
+1) base_agent.py
+- Purpose: Establish a consistent interface for all agents and shared utilities.
+- Key API:
+  - `handle(session_id, query, session, memory_context) -> AgentResult`: required entrypoint.
+  - Shared helpers for standardized success/error responses and message formatting.
+- Inputs: normalized user query, session turns, optional memory context snapshot.
+- Outputs: `AgentResult` containing message text, optional facts (e.g., receipt), and flags.
+
+2) general_info_agent.py
+- Purpose: Fast, reliable answers to general bakery questions (hours, branches, policies).
+- Logic:
+  - Rule checks for common intents (e.g., open hours, address) to answer instantly.
+  - Falls back to RAG (Whoosh/FAISS + rerank) when the answer requires longer text.
+- Inputs: user query + retrieval context.
+- Outputs: concise factual answer with optional citations.
+- Edge cases: ambiguous branch names → prompts user to choose; off-hours queries → returns correct schedule.
+
+3) product_info_agent.py
+- Purpose: Product discovery — names, prices, availability, categories, recommendations.
+- Data Sources: SQLAlchemy Product model (populated from CSV), `menu_store.py` fuzzy search.
+- Logic:
+  - Extract product/quantity terms; match against DB with case-insensitive and fuzzy strategies.
+  - Respond with price, category, and availability; propose similar items if not found.
+- Inputs: user query with possible item names; optional filters (price, category).
+- Outputs: structured message about items; can return a list or single product details.
+- Edge cases: typo-heavy names → uses fuzzy match; multiple candidates → asks a clarifying question.
+
+4) order_agent.py
+- Purpose: End-to-end order management with a server-side cart, validations, and persistence.
+- Core Responsibilities:
+  - Maintain per-session cart (items, fulfillment, customer info, payment).
+  - Validate stock, branch hours, and required fields before confirm.
+  - Implement Phase 1-first modify policy: ask what to change, apply specific change, then preview.
+  - Finalize orders: create Order/OrderItem rows; decrement product stock atomically.
+- Dual API (Gemini-first):
+  - Enhanced/context phase builds an authoritative memory snapshot (summary, last turns, cart_state).
+  - Primary/decision phase returns: `response_type` (ask_details | modify_cart | confirm_order | show_receipt), `message`, `cart_updates`, and `cart_state`.
+- Important Flags in cart_state:
+  - `awaiting_details`: collecting missing info
+  - `awaiting_confirmation`: user needs to explicitly confirm
+  - `awaiting_fulfillment`: waiting for pickup/delivery specifics
+- Modify Flow (Phase 1-first):
+  1. User: "modify" → agent returns a short prompt: what to change (items, time, branch, name/phone, payment).
+  2. User specifies field → agent applies targeted update and recalculates totals.
+  3. Agent shows a preview receipt and sets `awaiting_confirmation = True`.
+  4. Loop until user confirms or cancels.
+- Confirm Flow (Preview-first):
+  - Only finalize on explicit confirm. On finalize:
+    - Re-query products into the active SQLAlchemy session.
+    - Decrement `quantity_in_stock`, insert `OrderItem` rows, commit, set status to confirmed.
+    - Cache receipt text by session for retrieval.
+- Cancel Flow:
+  - If awaiting confirmation and user cancels: clear cart safely (no stock changes) and exit.
+- Edge cases & Guards:
+  - Invalid pickup time relative to branch hours → ask for a valid time window.
+  - Product stock insufficiency → return a concise message with available quantity.
+
+5) meta_agent.py
+- Purpose: Handles system/meta queries (about the assistant, capabilities, version).
+- Behavior: Returns brief, friendly answers without touching cart or DB.
+
 ### app/
 - `main.py`         : FastAPI app, API endpoints, CORS, static file serving
 - `controller.py`   : Orchestrates NLU, agent routing, session, LLM prompt building
@@ -35,8 +98,41 @@ backend/
 - `retrieval.py`    : Hybrid retrieval (FAISS dense + Whoosh BM25 sparse)
 - `rerank.py`       : Cross-encoder reranking of retrieved docs
 - `prompt_builder.py`: Builds LLM prompts with context, history, agent rules
-- `generate.py`     : LLM client (Groq API)
+- `generate.py`     : LLM client (Gemini‑first via Dual API System)
 - `postprocess.py`  : Cleans, formats, and adds citations to LLM output
+
+#### App Deep Dive
+
+1) main.py
+- FastAPI factory, CORS, and route registration (e.g., POST `/query`).
+- Serves minimal frontend assets for local testing.
+
+2) controller.py
+- Entry coordinator: pulls session history, calls preprocessing + NLU, chooses agent.
+- Packages memory context (summary, last messages, authoritative cart) for the Dual API.
+- Returns a unified JSON to frontend (message, facts like receipt, flags).
+
+3) config.py
+- Reads environment variables (GEMINI_API_KEY, providers, models). Defaults are safe.
+- Provides a `.validate()` guard for critical settings.
+
+4) preprocess.py / postprocess.py
+- Preprocess: lowercasing, trimming, simple replacements, and intent cues.
+- Postprocess: normalize formatting and attach citations (if any) to answers.
+
+5) retrieval.py / rerank.py / embed.py
+- retrieval.py: orchestrates hybrid search (FAISS dense + Whoosh BM25).
+- rerank.py: cross-encoder reranking to improve top-k relevance.
+- embed.py: embedding generation for documents/queries (model configurable).
+
+6) prompt_builder.py
+- Builds LLM prompts with: session context, cart facts, validation rules, and constraints.
+- Produces separate prompts for Enhanced (context) and Primary (decision) stages.
+
+7) generate.py (Gemini-first via Dual API)
+- Handles LLM calls in a provider-agnostic way; Dual API decides which provider to use.
+- Enhanced: concise memory snapshot (summary, last turns, cart state, features).
+- Primary: returns `response_type`, `message`, `cart_updates`, `cart_state`.
 
 ### data/
 - `database.py`     : SQLAlchemy DB setup (SQLite), session, table creation
@@ -92,7 +188,9 @@ backend/
   - **Retrieval**: `retrieval.py` uses hybrid search (FAISS + Whoosh) to fetch relevant docs.
   - **Reranking**: `rerank.py` sorts retrieved docs by relevance.
   - **Prompt Building**: `prompt_builder.py` constructs a prompt with context, history, and agent facts.
-  - **LLM Generation**: `generate.py` calls Groq LLM for final response.
+  - **LLM Generation (Dual API, Gemini-first)**:
+    - Enhanced phase: Gemini builds a memory snapshot (summary, last messages, cart_state, features).
+    - Primary phase: Gemini returns action and message: `response_type` (ask_details | modify_cart | confirm_order | show_receipt), `message`, optional `cart_updates`, and `cart_state` flags.
   - **Postprocessing**: `postprocess.py` formats and adds citations.
 8. **Response**: Controller returns the response and citations to the frontend, and logs the assistant message in the session.
 
@@ -159,3 +257,124 @@ backend/
 ---
 
 *This README reflects the actual, deeply analyzed structure and workflow of the BAKERY-CHAT backend as of August 2025.*
+
+---
+
+## Plain‑English Summary (for non‑technical readers)
+
+BAKERY‑CHAT is a helpful assistant for a bakery. You can chat with it to ask about store hours, locations, and products, and you can place an order. When you order, the assistant keeps track of your cart (what you want to buy), your name and phone, where and when you’ll pick it up (or get it delivered), and how you want to pay.
+
+Before confirming, it always shows you a clear preview of your order (items, prices, tax, total, pickup time, and branch). If you say “modify,” it will ask what you want to change (like time, branch, items, or payment) and then show the updated preview. When you say “confirm,” it safely saves the order and reduces product stock in the store’s system. If you say “cancel,” it clears the cart without changing stock.
+
+Behind the scenes, the assistant uses a smart language model (Gemini) to understand your messages and a small database to store products and orders. It also checks simple rules like “is the pickup time inside the branch’s open hours?” and “is there enough stock?” to make sure your order is realistic. All this happens quickly so you can order with confidence.
+
+User preferences and likes are also stored to provide warm, personalized responses and suggest relevant items.
+
+In short: ask questions, build a cart, preview, modify as needed, and confirm—exactly like talking to a helpful clerk, but online.
+
+---
+
+## Future Work (Roadmap)
+
+- Multi‑item edits in one turn: allow “change cheesecake to 2 and pickup to 6 pm” in a single message with safe validation.
+- Delivery address validation and maps: verify addresses and estimate delivery windows.
+- Promotions and discounts: coupon codes, time‑based promos, and bundle pricing.
+- Real‑time stock: live updates when multiple customers order the same item.
+- Payment integrations: card/UPI flows with secure tokens and receipts by email/SMS.
+- User accounts and order history: repeat orders, favorites, and loyalty points.
+- Better recommendations: “people also buy” suggestions powered by browsing and purchase patterns.
+- Admin dashboard: view orders, edit inventory, and adjust hours from a web UI.
+- Observability: dashboards for errors, latency, and popular items/queries.
+- Internationalization: support multiple languages, currencies, and tax rules.
+
+---
+
+## Quickstart (Backend)
+
+1. Create and activate venv
+   - Linux/macOS:
+     - `python3 -m venv venv`
+     - `source venv/bin/activate`
+   - Windows (PowerShell):
+     - `py -3 -m venv venv`
+     - `venv\\Scripts\\Activate.ps1`
+
+2. Install dependencies
+   - `pip install -r backend/requirements.txt`
+
+3. Prepare data and DB
+   - `python backend/scripts/ingest_data.py` (build indices, load menu)
+   - Or run: `python backend/data/populate_db.py`
+
+4. Start API server (FastAPI + Uvicorn)
+   - `uvicorn backend.app.main:app --reload`
+   - API docs: http://127.0.0.1:8000/docs
+
+5. Try endpoints
+   - POST `/query` with JSON body `{ "session_id": "<uuid>", "message": "hi" }`
+
+---
+
+## Environment Configuration
+
+Supported (optional) environment variables:
+- `GEMINI_API_KEY`          – LLM generation provider key
+- `EMBED_MODEL`           – embedding model name (defaults in `config.py`)
+- `DB_URL`                – database URL (defaults to SQLite in `backend/data/bakery.db`)
+- `LOG_LEVEL`             – logging level (INFO/DEBUG)
+- `REDIS_URL`             – for session persistence (optional)
+
+Set via shell or a `.env` file at project root. `config.py` reads these with safe fallbacks.
+
+---
+
+## Data & Index Lifecycle
+
+- Update raw data in `backend/data/raw/`
+- Rebuild indices: `python backend/scripts/ingest_data.py`
+- Regenerate DB if schema/menu changes: `python backend/data/populate_db.py`
+
+Processed artifacts:
+- `backend/data/processed/chunks.json`
+- `backend/data/processed/faiss_index.bin`
+- `backend/data/processed/whoosh_index/`
+
+---
+
+## Testing & Diagnostics
+
+- Run unit/e2e tests:
+  - `pytest -q` or `python tests/run_tests.py`
+- Ad‑hoc agent tests:
+  - `python backend/scripts/test_agents.py`
+- DB sanity:
+  - `python check_database.py`
+
+Troubleshooting tips:
+- Inventory not decrementing after confirm → ensure commit happens in `OrderAgent._finalize_order` and product instances are session-managed.
+- “modify” shows preview instead of asking → verify Phase 1 short‑circuit respects `response_type == "modify_cart"` flow.
+- Indentation errors → check recent edits around return blocks and conditional nesting.
+
+---
+
+## Frontend (Minimal)
+
+A simple chat UI exists under `frontend/`. To serve locally:
+- `cd frontend && npm install && npm start` (if a dev server is configured), or open `frontend/public/chat.html` directly for a basic UI.
+
+---
+
+## Versioning & Branching
+
+Feature/version branches follow the pattern:
+`Added_general_info_agent_product_info_agent_order_agent_vX.Y_pipeline`
+
+Create and push:
+```
+git checkout -b <branch>
+git commit -m "<message>"
+git push -u origin <branch>
+```
+
+Open a PR using the link printed by `git push` (GitHub).
+
