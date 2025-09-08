@@ -133,7 +133,8 @@ class OrderAgent(BaseAgent):
                 hh += 12
             if 0 <= hh <= 23 and 0 <= mm <= 59:
                 return time(hh, mm)
-            return None
+            else:
+                return None
 
         # 24-hour format with minutes: e.g., "05:00", "23:59"
         m24 = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -142,7 +143,8 @@ class OrderAgent(BaseAgent):
             mm = int(m24.group(2))
             if 0 <= hh <= 23 and 0 <= mm <= 59:
                 return time(hh, mm)
-            return None
+            else:
+                return None
 
         # 24-hour format hour-only: e.g., "5", "17"
         m24h = re.match(r"^(\d{1,2})$", s)
@@ -150,7 +152,8 @@ class OrderAgent(BaseAgent):
             hh = int(m24h.group(1))
             if 0 <= hh <= 23:
                 return time(hh, 0)
-            return None
+            else:
+                return None
 
         return None
 
@@ -292,6 +295,14 @@ class OrderAgent(BaseAgent):
             
         # Check for strong confirmation
         return any(phrase in ql for phrase in strong_confirmations)
+
+    def _is_cancel_request(self, query: str) -> bool:
+        ql = query.lower().strip()
+        return any(p in ql for p in ["cancel", "cancel order", "discard", "abort", "stop order", "clear order", "clear cart"]) and not any(p in ql for p in ["don't", "do not", "not now"])
+
+    def _is_modify_request(self, query: str) -> bool:
+        ql = query.lower().strip()
+        return any(p in ql for p in ["modify", "change", "edit", "update"]) and not any(p in ql for p in ["don't", "do not", "no change"]) 
 
     # --- New: robust fulfillment detection (handles typos/variants) ---
     @staticmethod
@@ -673,9 +684,9 @@ class OrderAgent(BaseAgent):
             unified_context = self._build_llm_context(session=session or [], cart=cart, memory_context=memory_context or {}, db=db)
             prompt = f"""
             You are an AI managing a complete bakery order system.
-
+            
             User Query: "{query}"
-
+            
             CONTEXT (authoritative): {json.dumps(unified_context)}
 
             Available Products (DB): {product_info}
@@ -921,9 +932,9 @@ class OrderAgent(BaseAgent):
             unified_context = self._build_llm_context(session=session, cart=cart, memory_context=memory_context or {}, db=db)
             prompt = f"""
             You are analyzing a user query to determine the appropriate next order action.
-
+            
             User Query: "{query}"
-
+            
             CONTEXT (authoritative): {json.dumps(unified_context)}
 
             Available Products (DB): {product_info}
@@ -1622,6 +1633,30 @@ class OrderAgent(BaseAgent):
                     print(f"[CART] Items: {[(item['product'].name, item['quantity']) for item in cart.items]}")
                     print(f"[CART] Total: ${cart.get_total():.2f}")
             
+            # Awaiting confirmation: handle confirm / modify / cancel before LLM
+            if cart.awaiting_confirmation:
+                if self._is_cancel_request(query):
+                    print("[CANCEL] User requested to cancel order while awaiting confirmation")
+                    # Clear cart safely (no stock changes since not finalized)
+                    cart.items.clear()
+                    cart.awaiting_confirmation = False
+                    cart.awaiting_details = False
+                    cart.fulfillment_type = None
+                    cart.customer_info.clear()
+                    cart.pickup_info.clear()
+                    cart.delivery_info.clear()
+                    cart.payment_method = None
+                    return self._ok("order", "Your order has been canceled. Let me know if you'd like to start a new one.", {"in_order_context": False})
+                if self._is_modify_request(query):
+                    print("[MODIFY] User requested to modify order while awaiting confirmation")
+                    cart.awaiting_details = True
+                    cart.awaiting_confirmation = False
+                    return self._llm_clarify_next_step("What would you like to change? You can update quantity, items, time, branch, name, phone, or payment.", cart, memory_context, db)
+                if self._is_strong_confirmation(query):
+                    print("[CONFIRMATION] User confirmed while awaiting confirmation - finalizing order")
+                    cart.awaiting_confirmation = False
+                    return self._finalize_order(db, cart, session_id, memory_context)
+            
             # If user utterance looks like a time and we're in pickup flow, set pickup_time directly
             try:
                 if (cart.fulfillment_type == 'pickup'):
@@ -1643,7 +1678,7 @@ class OrderAgent(BaseAgent):
                             print(f"[CART] Set pickup_time from user query: {cart.pickup_info['pickup_time']}")
             except Exception:
                 pass
-
+            
             # NEW: Use LLM for COMPLETE order management - no hardcoded logic
             print("\n[LLM PHASE 1] Initial order analysis with Enhanced API...")
             print("[LLM] Calling _handle_order_with_llm()...")
@@ -1706,7 +1741,7 @@ class OrderAgent(BaseAgent):
                             print(f"[NLU FALLBACK] Set branch_name from 'location': {cart.branch_name}")
             except Exception as e:
                 print(f"[NLU FALLBACK] Failed to apply entity-based add-to-cart: {e}")
-
+            
             # Let LLM handle the entire order flow based on context
             order_action = self._handle_order_with_llm(query, cart, memory_context, db, session)
             print(f"[LLM] _handle_order_with_llm() returned: {order_action}")
@@ -1854,11 +1889,37 @@ class OrderAgent(BaseAgent):
                 cart.awaiting_fulfillment = order_action["cart_state"].get("awaiting_fulfillment", True)
                 print(f"[CART STATE] Updated cart flags: awaiting_details={cart.awaiting_details}, awaiting_confirmation={cart.awaiting_confirmation}, awaiting_fulfillment={cart.awaiting_fulfillment}")
                 
-                # IMMEDIATE FINALIZATION: If LLM set awaiting_confirmation=False, finalize now
+                # Preview-first policy: even if LLM said confirm_order with awaiting_confirmation=False,
+                # we still show a preview and await explicit user confirmation.
                 if not cart.awaiting_confirmation and order_action.get("response_type") == "confirm_order":
-                    print("[CART STATE] LLM set awaiting_confirmation=False with confirm_order - finalizing immediately")
-                    cart.last_prompt = "confirm_order"
-                    return self._finalize_order(db, cart, session_id, memory_context)
+                    print("[CART STATE] LLM requested confirm_order; showing preview and awaiting explicit confirmation instead of auto-finalizing")
+                    # Only proceed if details are actually complete
+                    missing_for_confirmation = self._get_missing_details(cart)
+                    if missing_for_confirmation or not cart.fulfillment_type:
+                        print(f"[CART STATE GUARD] Still missing details {missing_for_confirmation} or fulfillment not set; delegating to LLM for clarification")
+                        cart.awaiting_details = True
+                        cart.awaiting_confirmation = False
+                        if missing_for_confirmation:
+                            cart.expected_field = missing_for_confirmation[0]
+                        return self._llm_clarify_next_step(
+                            f"Collect missing: {', '.join(missing_for_confirmation)}." if missing_for_confirmation else "Please collect fulfillment details (pickup or delivery).",
+                            cart,
+                            memory_context,
+                            db,
+                        )
+                    # Details complete → preview first
+                    preview_receipt = self._build_preview_receipt(cart)
+                    cart.last_prompt = "preview_receipt"
+                    cart.awaiting_confirmation = True
+                    return self._ok(
+                        "order",
+                        "Please review your order and confirm to place it.",
+                        {
+                            "in_order_context": True,
+                            "preview_receipt_text": preview_receipt,
+                            "awaiting_confirmation": True,
+                        },
+                    )
                 
                 # Server-side guard: do not allow awaiting_confirmation unless details complete
                 missing_for_confirmation = self._get_missing_details(cart)
@@ -1875,7 +1936,8 @@ class OrderAgent(BaseAgent):
                         db,
                     )
                 # If details are complete, always show preview receipt immediately
-                if not self._get_missing_details(cart):
+                # UNLESS the LLM specifically returned modify_cart (which should ask what to modify)
+                if not self._get_missing_details(cart) and (order_action.get("response_type") or "").lower() != "modify_cart":
                     print("[CONFIRMATION] Details complete and awaiting confirmation - showing preview receipt")
                     preview_receipt = self._build_preview_receipt(cart)
                     cart.last_prompt = "preview_receipt"
@@ -1899,10 +1961,20 @@ class OrderAgent(BaseAgent):
             # Trust the LLM's response - prioritize finalize when it says confirm_order and details are complete
             missing_for_confirmation = self._get_missing_details(cart)
             if phase1_response_type == "confirm_order" and not missing_for_confirmation and cart.fulfillment_type:
-                print("[LLM TRUST] LLM requested confirm_order and details complete - finalizing now")
-                cart.awaiting_confirmation = False
-                cart.last_prompt = "confirm_order"
-                return self._finalize_order(db, cart, session_id, memory_context)
+                # Preview-first policy: show preview and await explicit confirmation
+                print("[LLM TRUST] LLM requested confirm_order and details complete - showing preview and awaiting explicit confirmation")
+                preview_receipt = self._build_preview_receipt(cart)
+                cart.awaiting_confirmation = True
+                cart.last_prompt = "preview_receipt"
+                return self._ok(
+                    "order",
+                    "Please review your order and confirm to place it.",
+                    {
+                        "in_order_context": True,
+                        "preview_receipt_text": preview_receipt,
+                        "awaiting_confirmation": True,
+                    },
+                )
 
             # If LLM provided a good message and it's not a confirm_order case, use it instead of generic messages
             if phase1_message and phase1_message.strip() and not phase1_message.startswith("Collect missing"):
@@ -1961,6 +2033,10 @@ class OrderAgent(BaseAgent):
                         preview_receipt = self._build_preview_receipt(cart)
                         cart.awaiting_confirmation = True
                         facts.update({"preview_receipt_text": preview_receipt, "awaiting_confirmation": True})
+                elif phase1_response_type == "modify_cart":
+                    # LLM wants to ask what to modify - use its message directly
+                    print("[SHORT-CIRCUIT] LLM returned modify_cart - asking what to modify")
+                    return self._ok("order", phase1_message, facts)
                 # Trust the LLM's message completely - don't override it
                 return self._ok("order", phase1_message, facts)
 
@@ -1990,7 +2066,7 @@ class OrderAgent(BaseAgent):
                     print("[CHECKOUT] Fulfillment not set - delegating to LLM for clarification")
                     cart.awaiting_fulfillment = True
                     return self._llm_clarify_next_step("Please collect fulfillment details (pickup or delivery).", cart, memory_context, db)
-
+                
                 # Check what's missing based on LLM analysis
                 print("[CHECKOUT] Checking for missing details...")
                 missing_details = self._get_missing_details(cart)
