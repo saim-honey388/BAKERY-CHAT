@@ -11,7 +11,9 @@ from ..agents.general_info_agent import GeneralInfoAgent
 from ..agents.product_info_agent import ProductInfoAgent
 from ..agents.order_agent import OrderAgent
 from ..agents.meta_agent import MetaAgent
+from ..agents.returning_user_agent import ReturningUserAgent
 from .session import SessionManager
+from .config import Config
 from ..schemas.io_models import AgentResult
 from .prompt_builder import PromptBuilder
 
@@ -20,6 +22,7 @@ AGENT_MAP = {
     "product_info": ProductInfoAgent(),
     "order": OrderAgent(),
     "meta": MetaAgent(),
+    "returning_user": ReturningUserAgent(),
 }
 
 class Controller:
@@ -49,8 +52,11 @@ class Controller:
         print(f"[WORKFLOW] 1b. Memory context extracted: {len(memory_context.get('important_features', []))} features")
         print(f"[WORKFLOW] 1c. Cart info extracted: {memory_context.get('cart_state', {})}")
 
-        # routing: rules first
+        # routing: check if a specific agent is awaiting the user's reply
         print("[WORKFLOW] 2. Detecting intent...")
+        pend = self.session_manager.pop_pending_clarification(session_id)
+        pending_agent = pend.get("agent") if pend else None
+        pending_question = pend.get("question") if pend else None
         intents = rule_based_intents(query)
         print(f"[WORKFLOW] 2a. Rule-based intents detected: {intents}")
         if not intents:
@@ -58,7 +64,11 @@ class Controller:
             routed = llm_route(query)
             intents = routed.get("intents", ["general_info"]) if isinstance(routed, dict) else ["general_info"]
             print(f"[WORKFLOW] 2c. LLM router intents: {intents}")
-        # Bias routing to order agent if an order flow is in progress OR if user is making ordering requests
+            # If conversation context indicates we're in a returning-user follow-up, bias back to returning_user
+            if pending_agent == "returning_user":
+                intents = ["returning_user"] + [i for i in intents if i != "returning_user"]
+                print("[WORKFLOW] 2c+. Biasing to returning_user due to active follow-up context")
+        # Bias routing based on active flow and session context
         try:
             order_agent: OrderAgent = AGENT_MAP.get("order")  # type: ignore
             cart_state = order_agent.get_cart_state(session_id) if hasattr(order_agent, "get_cart_state") else {"has_cart": False}
@@ -73,13 +83,87 @@ class Controller:
             ordering_keywords = ["want", "order", "get", "take", "add", "cart", "pickup", "delivery", "2", "two"]
             looks_like_order = any(keyword in query.lower() for keyword in ordering_keywords)
             
-            # Route to order agent if in order flow OR if it looks like an ordering request
-            if in_order_flow or looks_like_order:
+            # Hard context-first shortcut: if user references "my order" and there is no active cart/context, prefer returning_user
+            ql = query.lower()
+            no_active_cart = not (cart_state.get('has_cart') or in_order_flow)
+            memory_cart = memory_context.get('cart_state') if isinstance(memory_context, dict) else {}
+            memory_no_cart = isinstance(memory_cart, dict) and (memory_cart.get('status') in ("no_cart", "empty") or not memory_cart.get('items'))
+            # Determine lookup context from important features and recent messages
+            imp_features = memory_context.get('important_features') if isinstance(memory_context, dict) else []
+            imp_text = " ".join(imp_features).lower() if isinstance(imp_features, list) else str(imp_features).lower()
+            lookup_signals = ["retrieve order", "order status", "past order", "previous order", "order history", "receipt", "access order history", "show receipt"]
+            is_lookup_context = no_active_cart and (any(sig in imp_text for sig in lookup_signals) or pending_agent == "returning_user")
+            if no_active_cart and memory_no_cart and ("my order" in ql):
+                intents = ["returning_user"] + [i for i in intents if i not in ("returning_user", "order")]
+                print("[WORKFLOW] 2c+. Context-first routing to returning_user (fresh session mentions 'my order')")
+
+            # Route to order agent if in order flow OR if it looks like an ordering request,
+            # but allow product_info to interleave during order flow when user asks product questions.
+            if (in_order_flow or looks_like_order) and not is_lookup_context:
                 if "order" not in intents:
                     intents = ["order"] + [i for i in intents if i != "order"]
+                # If user also asked a product_info question, prioritize it, then keep order next
+                if "product_info" in intents:
+                    intents = ["product_info"] + [i for i in intents if i != "product_info"]
+                    print("[WORKFLOW] 2d. In order flow but prioritizing product_info for product question; order kept for continuity")
+                else:
+                    # No product_info: keep order first
+                    intents = ["order"] + [i for i in intents if i != "order"]
                     print(f"[WORKFLOW] 2d. Biased routing to order agent. In order flow: {in_order_flow}, Looks like order: {looks_like_order}")
+
+            # Route to returning_user agent for post-session lookups (order status/history/items) when not in order flow
+            returning_keywords = [
+                "order status", "status of my order", "what is my order status", "repeat my order",
+                "what did i order", "my last order", "previous order", "order history", "show my receipt",
+                "receipt for order", "items i ordered", "what items did i placed order for", "what items did i add to my order",
+                "what items are there in my order", "what items are in my order", "what is in my order", "what's in my order",
+                "show items in my order", "list items in my order"
+            ]
+            # Prefer returning_user if there is no active cart/details/confirmation and memory shows no cart
+            # recompute ql already defined above
+            context_hint = ("my order" in ql and any(tok in ql for tok in ["items", "status", "receipt", "history"]))
+            if no_active_cart and (any(k in ql for k in returning_keywords) or context_hint or is_lookup_context):
+                if memory_no_cart:
+                    # Prioritize returning_user and de-prioritize order to avoid false routing
+                    intents = ["returning_user"] + [i for i in intents if i not in ("returning_user", "order")]
+                    print("[WORKFLOW] 2e. Context-based routing to returning_user (no active cart; past-order lookup)")
         except Exception:
             pass
+
+        # One-turn pending with intent override:
+        # - If the next user message looks like an answer to the pending agent's clarification, route back to it
+        # - If it looks like a new intent (e.g., ordering/product), ignore pending and route normally
+        # This pending is already one-turn due to pop_pending_agent above.
+        if pending_agent in AGENT_MAP:
+            def _looks_like_returning_user_answer(text: str) -> bool:
+                import re
+                t = text.strip()
+                # Order number: 4-8 digits
+                if re.fullmatch(r"\d{4,8}", t):
+                    return True
+                # Phone patterns (simple): digits, spaces, dashes, plus; at least 7 digits overall
+                digits = re.sub(r"\D", "", t)
+                if len(digits) >= 7:
+                    return True
+                # Name-only short token (e.g., 'Saim')
+                if len(t.split()) <= 3 and all(ch.isalpha() or ch in "-'" for ch in t.replace(" ", "")):
+                    return True
+                # Contains label-like hints
+                if any(k in t.lower() for k in ["order number", "order no", "phone", "name:", "order #"]):
+                    return True
+                return False
+
+            # Check match against the exact pending question content to reduce confusion with order agent asks
+            question_hint = (pending_question or "").lower()
+            if pending_agent == "returning_user":
+                answer_like = _looks_like_returning_user_answer(query)
+                # If the pending question clearly asked for order id/name/phone/time, require answer-like
+                requires_answer = any(k in question_hint for k in ["order number", "order no", "name", "phone", "time"])
+                if requires_answer and answer_like and "product_info" not in intents and not looks_like_order:
+                    intents = ["returning_user"] + [i for i in intents if i != "returning_user"]
+                    print("[WORKFLOW] 2f. Pending returning_user honored (answer-like reply)")
+                else:
+                    print("[WORKFLOW] 2f. Pending returning_user ignored (new intent detected)")
         print(f"[WORKFLOW] 2b. Intent(s) detected: {intents}")
 
         # extract entities once and pass them into agents via the conversation list
@@ -119,6 +203,15 @@ class Controller:
             res = agent.handle(session_id, query, session=session_with_entities, memory_context=agent_memory_context)
             results.append(res)
             print(f"[WORKFLOW] 4b. Agent '{agent.name}' returned facts: {res.facts}")
+
+            # If agent requests clarification, remember the agent and exact question (one-turn)
+            try:
+                if isinstance(res.facts, dict) and (res.needs_clarification or res.clarification_question):
+                    q = res.clarification_question or ""
+                    self.session_manager.set_pending_clarification(session_id, intent, q)
+                    print(f"[WORKFLOW] 4b+. Set pending clarification for agent '{intent}': {q}")
+            except Exception:
+                pass
 
         if not results:
             results = [AGENT_MAP["general_info"].handle(session_id, query, session=self.session_manager.get_conversation_context(session_id))]
@@ -187,15 +280,31 @@ class Controller:
         prompt_builder = PromptBuilder()
         
         # Build prompt using your existing system + memory context
-        prompt = prompt_builder.build_prompt(
-            query=query,
-            context_docs=merged_context_docs,
-            conversation_history=self._format_conversation_for_prompt(session_id),
-            intents=intents
-        )
+        try:
+            prompt = prompt_builder.build_prompt(
+                query=query,
+                context_docs=merged_context_docs,
+                conversation_history=self._format_conversation_for_prompt(session_id),
+                intents=intents
+            )
+            print(f"DEBUG: Built prompt length: {len(prompt)}")
+            print(f"DEBUG: Prompt preview (first 500 chars): {prompt[:500]}...")
+        except Exception as e:
+            print(f"[ERROR] Prompt building failed: {e}")
+            import traceback
+            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+            prompt = f"User query: {query}\n\nPlease provide a helpful response about Sunrise Bakery."
         
         # ENHANCE the prompt with memory context (don't replace, enhance!)
-        enhanced_prompt = self._enhance_prompt_with_memory(prompt, memory_context, facts_blocks)
+        try:
+            enhanced_prompt = self._enhance_prompt_with_memory(prompt, memory_context, facts_blocks)
+            print(f"DEBUG: Enhanced prompt length: {len(enhanced_prompt)}")
+            print(f"DEBUG: Enhanced prompt preview (first 500 chars): {enhanced_prompt[:500]}...")
+        except Exception as e:
+            print(f"[ERROR] Prompt enhancement failed: {e}")
+            import traceback
+            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+            enhanced_prompt = prompt
 
         conversation_history = "\n".join([f"{m['role']}: {m['message']}" for m in self.session_manager.get_conversation_context(session_id)])
 
@@ -286,6 +395,8 @@ class Controller:
             print(f"[WORKFLOW] 6a. LLM generation successful: {type(final_text)}")
         except Exception as e:
             print(f"[ERROR] LLM generation failed: {e}")
+            import traceback
+            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
             final_text = "Sorry, I'm having trouble generating a response right now."
 
         # save assistant response

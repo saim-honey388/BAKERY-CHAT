@@ -454,7 +454,7 @@ class SessionManager:
                 parsed = json.loads(json_match.group())
                 return {
                     "summary": parsed.get("summary", "Fallback context"),
-                    "last_10_messages": [msg.get("message", "") for msg in conversation[-10:]],
+                    "last_10_messages": [msg.get("message", "") for msg in conversation[-14:]],
                     "cart_state": cart_state,
                     "important_features": parsed.get("important_features", []),
                     "rule_base": parsed.get("rule_base", ["business_hours_validation"])
@@ -465,7 +465,7 @@ class SessionManager:
         # Ultimate fallback - minimal context
         return {
             "summary": "Minimal fallback context",
-            "last_10_messages": [msg.get("message", "") for msg in conversation[-10:]],
+            "last_10_messages": [msg.get("message", "") for msg in conversation[-14:]],
             "cart_state": cart_state,
             "important_features": [],
             "rule_base": ["business_hours_validation"]
@@ -481,6 +481,44 @@ class SessionManager:
     def get_memory_context(self, session_id: str) -> Dict[str, Any]:
         """Get cached memory context if available."""
         return self.memory_features.get(session_id, {})
+
+    def set_pending_agent(self, session_id: str, agent_name: str) -> None:
+        """Mark an agent as awaiting the user's next reply."""
+        if session_id not in self.memory_features:
+            self.memory_features[session_id] = {}
+        self.memory_features[session_id]["pending_agent"] = agent_name
+
+    def pop_pending_agent(self, session_id: str) -> Optional[str]:
+        """Return and clear any pending agent awaiting next reply."""
+        ctx = self.memory_features.get(session_id, {})
+        agent = ctx.get("pending_agent")
+        if agent is not None:
+            # clear it
+            try:
+                del ctx["pending_agent"]
+            except Exception:
+                pass
+        return agent
+
+    # New: store and retrieve pending clarification context (agent + question)
+    def set_pending_clarification(self, session_id: str, agent_name: str, question: str) -> None:
+        if session_id not in self.memory_features:
+            self.memory_features[session_id] = {}
+        self.memory_features[session_id]["pending_agent"] = agent_name
+        self.memory_features[session_id]["pending_question"] = question
+
+    def pop_pending_clarification(self, session_id: str) -> Optional[Dict[str, str]]:
+        ctx = self.memory_features.get(session_id, {})
+        agent = ctx.get("pending_agent")
+        question = ctx.get("pending_question")
+        if agent or question:
+            try:
+                if "pending_agent" in ctx: del ctx["pending_agent"]
+                if "pending_question" in ctx: del ctx["pending_question"]
+            except Exception:
+                pass
+            return {"agent": agent, "question": question}
+        return None
     
     def calculate_memory_weights(self, context: Dict[str, Any]) -> Dict[str, float]:
         """Calculate memory weights based on importance."""

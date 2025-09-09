@@ -44,6 +44,8 @@ class Order(Base):
     status = Column(Enum(OrderStatus), nullable=False, default=OrderStatus.pending)
     pickup_or_delivery = Column(Enum(FulfillmentType), nullable=False)
     total_amount = Column(Float, nullable=True)  # Added field to store total order amount
+    pickup_delivery_time = Column(DateTime(timezone=True), nullable=True)  # Time for pickup/delivery
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)  # Time when order was confirmed
 
     customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order")

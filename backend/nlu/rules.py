@@ -8,7 +8,12 @@ GENERAL = ["hours", "timings", "timmings", "open", "close", "location",
 PRODUCT = ["menu", "pastry", "bread", "cupcake", "brownie",
            "chocolate", "flavor", "price", "prices", "recommend", "suggest", "best", "list", "available"]
 ORDER   = ["order", "buy", "book", "reserve", "pickup", "pick up", "deliver", "delivery", "place an order",
-           "add", "cart", "want", "get", "take", "cake", "cakes", "cheesecake", "croissant"]
+           "add", "cart", "add to cart", "remove from cart", "my cart", "want", "get", "take", "cake", "cakes", "cheesecake", "croissant"]
+RETURNING = [
+    "order status", "status of my order", "what is my order status", "repeat my order",
+    "what did i order", "what items did i order", "show my receipt", "receipt for order",
+    "my last order", "previous order", "order history", "what items did i placed order for"
+]
 META    = ["who are you", "tell me about yourself", "what are you", "about you", "yourself", "meta", "system"]
 
 
@@ -34,5 +39,6 @@ def rule_based_intents(query: str) -> List[str]:
     if _contains_any(query, GENERAL): intents.append("general_info")
     if _contains_any(query, PRODUCT): intents.append("product_info")
     if _contains_any(query, ORDER):   intents.append("order")
+    if _contains_any(query, RETURNING): intents.append("returning_user")
     if _contains_any(query, META):    intents.append("meta")
     return intents

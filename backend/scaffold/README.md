@@ -277,7 +277,13 @@ In short: ask questions, build a cart, preview, modify as needed, and confirm—
 ## Future Work (Roadmap)
 
 - Multi‑item edits in one turn: allow “change cheesecake to 2 and pickup to 6 pm” in a single message with safe validation.
-- Delivery address validation and maps: verify addresses and estimate delivery windows.
+- Delivery address validation and maps:
+  - Integrate geocoding (e.g., Google Maps Geocoding API, Mapbox) to validate and normalize addresses.
+  - Use Distance Matrix/Route APIs to compute ETA from selected branch to customer.
+  - Estimate delivery windows (e.g., 30–45 min) based on route time, prep buffer, and traffic.
+  - Persist normalized address + coordinates; avoid storing unnecessary PII.
+  - UI: show map preview with branch origin, route, and ETA; allow user to adjust address/pin.
+  - Edge cases: incomplete addresses, apartment/suite details, out‑of‑radius deliveries → prompt alternatives.
 - Promotions and discounts: coupon codes, time‑based promos, and bundle pricing.
 - Real‑time stock: live updates when multiple customers order the same item.
 - Payment integrations: card/UPI flows with secure tokens and receipts by email/SMS.

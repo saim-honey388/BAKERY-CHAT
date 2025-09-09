@@ -46,6 +46,24 @@ class ProductInfoAgent(BaseAgent):
             price_max = entities.get("price_max")
             requested_time = entities.get("time")
 
+            # If the user asked to see the menu, return the entire catalog
+            ql = q.lower()
+            if "menu" in ql or ("show" in ql and "menu" in ql) or ("list" in ql and "items" in ql):
+                all_products = db.query(Product).all()
+                if all_products:
+                    facts["items"] = [
+                        {
+                            "name": p.name,
+                            "price": p.price,
+                            "description": p.description,
+                            "category": p.category,
+                            "in_stock": p.quantity_in_stock > 0,
+                        }
+                        for p in all_products
+                    ]
+                    citations.append(Citation(source="database:products", snippet=f"menu: {len(all_products)} items"))
+                    return self._ok(intent="product_info", facts=facts, context_docs=[], citations=citations)
+
             # Build database query (STRICT: DB is source of truth)
             db_query = db.query(Product)
 

@@ -12,10 +12,10 @@ load_dotenv()
 class Config:
     """Configuration class for the application."""
     
-    # Groq API Configuration
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    ENHANCED_GROQ_API_KEY = os.getenv("ENHANCED_GROQ_API_KEY")
-    GROQ_LLM_MODEL = "llama-3.1-8b-instant"
+    # Groq API Configuration (commented out - using Gemini instead)
+    # GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    # ENHANCED_GROQ_API_KEY = os.getenv("ENHANCED_GROQ_API_KEY")
+    # GROQ_LLM_MODEL = "llama-3.1-8b-instant"
 
     # Provider Switches (groq|gemini)
     ENHANCED_PROVIDER = os.getenv("ENHANCED_PROVIDER", "gemini").lower()
@@ -32,7 +32,7 @@ class Config:
         print(f"[CONFIG] ENHANCED_PROVIDER={cls.ENHANCED_PROVIDER}")
         print(f"[CONFIG] PRIMARY_PROVIDER={cls.PRIMARY_PROVIDER}")
         print(f"[CONFIG] GEMINI_MODEL={cls.GEMINI_MODEL} fallback={cls.GEMINI_FALLBACK_MODEL} set={bool(cls.GEMINI_API_KEY)}")
-        print(f"[CONFIG] GROQ_MODEL={cls.GROQ_LLM_MODEL} set={bool(cls.GROQ_API_KEY)}")
+        # print(f"[CONFIG] GROQ_MODEL={cls.GROQ_LLM_MODEL} set={bool(cls.GROQ_API_KEY)}")
     
     # Redis Configuration
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -61,14 +61,15 @@ class Config:
         missing = []
         
         # Allow a 'test' sentinel value to skip enforcing external API keys during local tests
-        if not cls.GROQ_API_KEY or cls.GROQ_API_KEY in ("test", "dev"):
-            # Do not require GROQ_API_KEY for test/dev runs
-            pass
-        else:
-            if not cls.GROQ_API_KEY:
-                missing.append("GROQ_API_KEY")
-            if not cls.REDIS_HOST:
-                missing.append("REDIS_HOST")
+        # if not cls.GROQ_API_KEY or cls.GROQ_API_KEY in ("test", "dev"):
+        #     # Do not require GROQ_API_KEY for test/dev runs
+        #     pass
+        # else:
+        #     if not cls.GROQ_API_KEY:
+        #         missing.append("GROQ_API_KEY")
+        
+        if not cls.REDIS_HOST:
+            missing.append("REDIS_HOST")
         
         if missing:
             raise ValueError(f"Missing required configuration: {', '.join(missing)}")

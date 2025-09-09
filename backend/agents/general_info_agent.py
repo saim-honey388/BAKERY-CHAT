@@ -6,6 +6,8 @@ from .base_agent import BaseAgent
 from typing import Dict, Any
 from ..schemas.io_models import Citation
 import json
+import os
+import csv
 
 class GeneralInfoAgent(BaseAgent):
     name = "general_info"
@@ -36,39 +38,23 @@ class GeneralInfoAgent(BaseAgent):
             if retrieved_docs:
                 print(f"[RAG] Retrieved {len(retrieved_docs)} relevant documents")
                 
-                # Use LLM to analyze the query and retrieved information
-                prompt = f"""
-                You are a bakery information assistant. Analyze the user's query and provide a comprehensive answer using the retrieved information.
+                # Use prompt_builder.py rules for general_info agent
+                from ..app.prompt_builder import PromptBuilder
+                prompt_builder = PromptBuilder()
                 
-                User Query: "{query}"
+                # Build prompt using prompt_builder with general_info rules
+                context_docs = [{"text": doc['text'], "source": doc.get('source', 'data_file')} for doc in retrieved_docs]
+                conversation_history = f"Memory Context: {memory_context if memory_context else 'None'}"
                 
-                Memory Context: {memory_context if memory_context else "None"}
+                prompt = prompt_builder.build_prompt(
+                    query=query,
+                    context_docs=context_docs,
+                    conversation_history=conversation_history,
+                    intents=["general_info"]
+                )
                 
-                Retrieved Information:
-                {chr(10).join([f"Document {i+1}: {doc['text']}" for i, doc in enumerate(retrieved_docs)])}
-                
-                Your task is to:
-                1. Understand what the user is asking about (hours, location, delivery, services, etc.)
-                2. Provide accurate information from the retrieved documents
-                3. Use memory context to personalize the response
-                4. Format the response naturally and helpfully
-                
-                Return JSON with:
-                {{
-                    "facts": {{
-                        "query_type": "what user is asking about",
-                        "relevant_info": "key information from documents",
-                        "personalized_note": "using memory context if available"
-                    }},
-                    "citations": [
-                        {{
-                            "source": "document source",
-                            "snippet": "relevant text snippet"
-                        }}
-                    ],
-                    "response": "natural, helpful response to user"
-                }}
-                """
+                # Add JSON response format instruction
+                prompt += "\n\nReturn JSON with:\n{\n    \"facts\": {\n        \"query_type\": \"what user is asking about\",\n        \"relevant_info\": \"key information from documents\",\n        \"personalized_note\": \"using memory context if available\"\n    },\n    \"citations\": [\n        {\n            \"source\": \"document source\",\n            \"snippet\": \"relevant text snippet\"\n        }\n    ],\n    \"response\": \"natural, helpful response to user\"\n}"
                 
                 dual_api = DualAPISystem()
                 response = dual_api.generate_response_with_primary_api(prompt)
@@ -99,20 +85,47 @@ class GeneralInfoAgent(BaseAgent):
         # Fallback: Use basic information from data files
         try:
             # Read data files directly as fallback
-            import os
             data_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
             
             # Check what the user is asking about
             q = query.lower()
             
-            if "hours" in q or "open" in q or "close" in q:
+            if "menu" in q or "price" in q or "prices" in q:
+                # Return the entire menu from menu.csv
+                menu_file = os.path.join(data_path, 'menu.csv')
+                if os.path.exists(menu_file):
+                    items = []
+                    try:
+                        with open(menu_file, 'r', newline='') as f:
+                            reader = csv.DictReader(f)
+                            for row in reader:
+                                # Normalize common columns
+                                name = row.get('name') or row.get('item') or row.get('Item') or row.get('product')
+                                description = row.get('description') or row.get('Description') or row.get('details')
+                                price = row.get('price') or row.get('Price') or row.get('cost')
+                                category = row.get('category') or row.get('Category')
+                                item = {k: v for k, v in {
+                                    'name': name,
+                                    'description': description,
+                                    'price': price,
+                                    'category': category,
+                                }.items() if v}
+                                if item:
+                                    items.append(item)
+                    except Exception as e:
+                        print(f"[RAG FALLBACK] Failed reading menu.csv: {e}")
+                    facts = {"menu_items": items, "note": "Complete menu from data/raw/menu.csv"}
+                    cites = [Citation(source="menu.csv", snippet="Full menu loaded from data/raw/menu.csv")]
+                    return self._ok(intent="general_info", facts=facts, context_docs=[], citations=cites)
+            
+            if "hours" in q or "open" in q or "close" in q or "timing" in q or "time" in q:
                 # Read hours from general_info.txt
                 info_file = os.path.join(data_path, 'general_info.txt')
                 if os.path.exists(info_file):
                     with open(info_file, 'r') as f:
                         content = f.read()
-                    facts = {"hours": "Retrieved from data files", "content": content}
-                    cites = [Citation(source="general_info.txt", snippet="Hours information from data files")]
+                    facts = {"hours": content}
+                    cites = [Citation(source="general_info.txt", snippet=content[:200] + ("..." if len(content) > 200 else ""))]
                     return self._ok(intent="general_info", facts=facts, context_docs=[], citations=cites)
             
             elif "location" in q or "where" in q or "branch" in q:
@@ -122,7 +135,7 @@ class GeneralInfoAgent(BaseAgent):
                     with open(locations_file, 'r') as f:
                         locations = json.load(f)
                     facts = {"locations": locations}
-                    cites = [Citation(source="locations.json", snippet="Location information from data files")]
+                    cites = [Citation(source="locations.json", snippet="Loaded branch locations from data/raw/locations.json")]
                     return self._ok(intent="general_info", facts=facts, context_docs=[], citations=cites)
             
             elif "delivery" in q or "deliver" in q:
@@ -131,8 +144,8 @@ class GeneralInfoAgent(BaseAgent):
                 if os.path.exists(info_file):
                     with open(info_file, 'r') as f:
                         content = f.read()
-                    facts = {"delivery": "Retrieved from data files", "content": content}
-                    cites = [Citation(source="general_info.txt", snippet="Delivery information from data files")]
+                    facts = {"delivery": content}
+                    cites = [Citation(source="general_info.txt", snippet=content[:200] + ("..." if len(content) > 200 else ""))]
                     return self._ok(intent="general_info", facts=facts, context_docs=[], citations=cites)
                     
         except Exception as e:

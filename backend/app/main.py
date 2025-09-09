@@ -108,10 +108,10 @@ async def query_chatbot(request: QueryRequest):
     """
     try:
         print(f"DEBUG: Controller handling query for session {request.session_id}: {request.query}", flush=True)
-        # Decide whether to call the LLM: prefer explicit USE_LLM env var, else require a non-test GROQ_API_KEY
+        # Decide whether to call the LLM: prefer explicit USE_LLM env var, else require a non-test GEMINI_API_KEY
         use_llm_env = os.getenv("USE_LLM", "false").lower() in ("1", "true", "yes")
-        groq_key = Config.GROQ_API_KEY
-        has_real_key = bool(groq_key) and groq_key not in ("test", "dev")
+        gemini_key = Config.GEMINI_API_KEY
+        has_real_key = bool(gemini_key) and gemini_key not in ("test", "dev")
         call_llm = use_llm_env or has_real_key
         result = controller.handle_query(request.session_id, request.query, skip_llm=not call_llm)
 

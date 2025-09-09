@@ -180,6 +180,31 @@ class OrderAgent(BaseAgent):
         with open(path, 'r') as f:
             return json.load(f)
 
+    # --- Delivery helpers: address validation + ETA estimation (lightweight stubs) ---
+    def _validate_and_normalize_address(self, raw_address: str):
+        """Best-effort address normalization/validation.
+
+        Returns (normalized_address, error_message_or_None).
+        Placeholder for future geocoding integration.
+        """
+        try:
+            address = (raw_address or "").strip()
+            if not address:
+                return "", "The address seems empty. Please provide a complete delivery address."
+            if len(address) < 5:
+                return "", "The address looks too short. Please include street and number."
+            normalized = " ".join(address.split())
+            return normalized, None
+        except Exception:
+            return "", "I couldn't read that address. Please re-enter it."
+
+    def _estimate_delivery_window(self, branch_name, address: str) -> str:
+        """Return a simple ETA window string. In production, integrate Distance Matrix.
+
+        Heuristic: base 30–45 min; if branch unknown, return generic window.
+        """
+        return "30–45 min"
+
     @classmethod
     def _get_branch_hours_for_datetime(cls, branch_name: str, dt) -> tuple:
         """Return (open_time, close_time) for the given branch and datetime.date().
@@ -1481,6 +1506,24 @@ class OrderAgent(BaseAgent):
         # Mark order as confirmed now that stock is decremented and items recorded
         try:
             order.status = OrderStatus.confirmed
+            order.confirmed_at = datetime.datetime.now()
+            
+            # Set pickup/delivery time based on fulfillment type
+            if cart.fulfillment_type == 'pickup' and 'pickup_time' in cart.pickup_info:
+                pickup_time_str = cart.pickup_info['pickup_time']
+                parsed_time = self._parse_hour_str_to_time(pickup_time_str)
+                if parsed_time:
+                    # Combine with today's date for pickup time
+                    pickup_datetime = datetime.datetime.combine(datetime.date.today(), parsed_time)
+                    order.pickup_delivery_time = pickup_datetime
+            elif cart.fulfillment_type == 'delivery' and 'delivery_time' in cart.delivery_info:
+                delivery_time_str = cart.delivery_info['delivery_time']
+                parsed_time = self._parse_hour_str_to_time(delivery_time_str)
+                if parsed_time:
+                    # Combine with today's date for delivery time
+                    delivery_datetime = datetime.datetime.combine(datetime.date.today(), parsed_time)
+                    order.pickup_delivery_time = delivery_datetime
+            
             print(f"DEBUG: Order status set to confirmed for Order ID: {order.id}")
         except Exception as e:
             print(f"DEBUG: Failed to set order status to confirmed: {e}")
@@ -1725,7 +1768,12 @@ class OrderAgent(BaseAgent):
                         else:
                             cart.pickup_info['pickup_time'] = pick
                     if nlu.get("address"):
-                        cart.delivery_info['address'] = nlu.get("address")
+                        addr = str(nlu.get("address")).strip()
+                        normalized, err = self._validate_and_normalize_address(addr)
+                        if err:
+                            cart.expected_field = 'address'
+                            return self._llm_clarify_next_step(err, cart, memory_context, db)
+                        cart.delivery_info['address'] = normalized
                     if nlu.get("delivery_time"):
                         cart.delivery_info['delivery_time'] = nlu.get("delivery_time")
                     # Branch
@@ -1806,7 +1854,12 @@ class OrderAgent(BaseAgent):
                             print("[CART UPDATE] Ignoring invalid fulfillment_type that looks like payment method")
                         # Fulfillment specific
                         if 'address' in info:
-                            cart.delivery_info['address'] = info['address']
+                            addr = str(info['address']).strip()
+                            normalized, err = self._validate_and_normalize_address(addr)
+                            if err:
+                                cart.expected_field = 'address'
+                                return self._llm_clarify_next_step(err, cart, memory_context, db)
+                            cart.delivery_info['address'] = normalized
                         if 'delivery_time' in info:
                             cart.delivery_info['delivery_time'] = info['delivery_time']
                         if 'pickup_time' in info:
@@ -2406,11 +2459,24 @@ class OrderAgent(BaseAgent):
         elif 'address' in missing_details and cart.fulfillment_type == 'delivery':
             cart.awaiting_details = True
             cart.expected_field = 'address'
-            return self._llm_clarify_next_step("Collect missing: address.", cart, {}, None)
+            # Provide guidance for a better address entry
+            return self._llm_clarify_next_step(
+                "Please provide your delivery address (street, number, city).",
+                cart,
+                {},
+                None,
+            )
         elif 'delivery_time' in missing_details and cart.fulfillment_type == 'delivery':
             cart.awaiting_details = True
             cart.expected_field = 'delivery_time'
-            return self._llm_clarify_next_step("Collect missing: delivery_time.", cart, {}, None)
+            # Offer a simple ETA hint for guidance
+            eta_hint = self._estimate_delivery_window(cart.branch_name, cart.delivery_info.get('address') or "")
+            return self._llm_clarify_next_step(
+                f"At what time should we deliver? Typical window is {eta_hint} from now.",
+                cart,
+                {},
+                None,
+            )
         elif 'payment_method' in missing_details:
             cart.awaiting_details = True
             cart.expected_field = 'payment_method'
